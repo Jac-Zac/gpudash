@@ -6,12 +6,16 @@
 
 use std::process::{Command, Stdio};
 
+/// Post a notification in the background (the first one may wait on macOS's permission prompt).
 pub fn notify(title: &str, body: &str, sound: bool) {
-    #[cfg(notifier)]
-    if bundle::post(title, body, sound) {
-        return;
-    }
-    osascript(title, body, sound);
+    let (title, body) = (title.to_string(), body.to_string());
+    std::thread::spawn(move || {
+        #[cfg(notifier)]
+        if bundle::post(&title, &body, sound) {
+            return;
+        }
+        osascript(&title, &body, sound);
+    });
 }
 
 fn osascript(title: &str, body: &str, sound: bool) {
@@ -82,18 +86,30 @@ mod bundle {
         Ok(app)
     }
 
-    /// Launch the helper through LaunchServices (`open`), which is what lets macOS
-    /// attach the app's icon and its notification permission.
+    /// Run the helper directly, which hands it the text reliably. Until macOS knows the app
+    /// (exit code 2: "not allowed"), launch it once through LaunchServices (`open`) instead;
+    /// that registers it and shows the permission prompt.
     pub fn post(title: &str, body: &str, sound: bool) -> bool {
         let Some(app) = app() else { return false };
-        Command::new("open")
-            .args(["-g", "-n"])
-            .arg(app)
-            .arg("--args")
-            .args([title, body, if sound { "sound" } else { "" }])
+        let args = [title, body, if sound { "sound" } else { "" }];
+        let direct = Command::new(app.join("Contents/MacOS/gpudash-notify"))
+            .args(args)
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
+            .status();
+        match direct.map(|s| s.code()) {
+            Ok(Some(0)) => true,
+            Ok(Some(2)) => Command::new("open")
+                .args(["-g", "-n"])
+                .arg(app)
+                .arg("--args")
+                .args(args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success()),
+            _ => false,
+        }
     }
 }

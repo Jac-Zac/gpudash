@@ -144,6 +144,10 @@ fn draw_cluster(f: &mut Frame, area: Rect, app: &App, ci: usize, c: &Cluster, jo
     }
     if c.loading {
         title.extend([spinner(app.tick), Span::raw(" ")]);
+        let waited = c.loading_since.elapsed().as_secs();
+        if waited >= 5 {
+            title.push(dim(format!("{waited}s ")));
+        }
     }
     let mut block = panel().title(Line::from(title));
     if let Some(e) = &c.error {
@@ -303,15 +307,18 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
                 dim(format!("{tag:<8}")),
                 Span::styled(format!("{:<7}", g.name), Style::new().fg(TEXT).bold()),
                 Span::styled(format!("{:<7}", temp_text(g.temp)), Style::new().fg(temp_color(g.temp as f64)).bold()),
-                dim("util  "),
+                Span::styled("util  ", Style::new().fg(rgb(UTIL_FROM))),
             ];
-            util.extend(big_bar(g.util as f64 / 100.0, width));
-            util.push(Span::styled(format!(" {:>4}%", g.util), Style::new().fg(TEXT).bold()));
+            util.extend(big_bar(g.util as f64 / 100.0, width, UTIL_FROM, UTIL_TO));
+            util.push(Span::styled(format!(" {:>4}%", g.util), Style::new().fg(rgb(UTIL_TO)).bold()));
             lines.push(Line::from(util));
 
-            let mut mem = vec![dim(format!("{:<22}", "")), dim("mem   ")];
-            mem.extend(big_bar(g.mem_used as f64 / g.mem_total.max(1) as f64, width));
-            mem.push(text(format!(" {:>3.0}/{:.0} GB", g.mem_used as f64 / 1024.0, g.mem_total as f64 / 1024.0)));
+            let mut mem = vec![dim(format!("{:<22}", "")), Span::styled("mem   ", Style::new().fg(rgb(MEM_FROM)))];
+            mem.extend(big_bar(g.mem_used as f64 / g.mem_total.max(1) as f64, width, MEM_FROM, MEM_TO));
+            mem.push(Span::styled(
+                format!(" {:>3.0}/{:.0} GB", g.mem_used as f64 / 1024.0, g.mem_total as f64 / 1024.0),
+                Style::new().fg(rgb(MEM_TO)).bold(),
+            ));
             lines.push(Line::from(mem));
         }
         if j.gpus.len() > 4 {

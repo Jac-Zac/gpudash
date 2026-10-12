@@ -3,7 +3,9 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, FixedOffset, NaiveDateTime, TimeZone, Utc};
 
@@ -78,37 +80,66 @@ cat "$t"/* 2>/dev/null
 rm -rf "$t"
 "#;
 
+/// Time limits, so a hung connection shows an error instead of loading forever.
+const CHECK_LIMIT: Duration = Duration::from_secs(5);
+const CONNECT_LIMIT: Duration = Duration::from_secs(30);
+const RUN_LIMIT: Duration = Duration::from_secs(60);
+
+/// Wait for a child process, killing it if it takes longer than `limit`.
+fn wait_limit(child: &mut Child, limit: Duration) -> Option<ExitStatus> {
+    let start = Instant::now();
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Some(status);
+        }
+        if start.elapsed() >= limit {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// Make sure a shared ssh connection is up, so each poll skips the login handshake.
 /// The master is started with no pipes attached, otherwise it would hold our output open.
 fn ensure_master(host: &str) -> Result<(), String> {
-    let alive = Command::new("ssh")
+    let mut check = Command::new("ssh")
         .args(["-o", CONTROL_PATH, "-O", "check", host])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
-    if alive {
-        return Ok(());
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    match wait_limit(&mut check, CHECK_LIMIT) {
+        Some(s) if s.success() => return Ok(()),
+        Some(_) => {}
+        // the shared connection is wedged; keep-alives (below) make it exit on its own soon
+        None => return Err("ssh connection is stuck, retrying…".into()),
     }
     let errpath = std::env::temp_dir().join(format!("gpudash-{host}.err"));
     let errfile = File::create(&errpath).map_err(|e| e.to_string())?;
-    let status = Command::new("ssh")
+    let mut master = Command::new("ssh")
         .args([
             "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=10",
             "-o", "ControlMaster=yes",
             "-o", "ControlPersist=10m",
+            // notice a dead connection within ~45s and close it, so the next poll reconnects
+            "-o", "ServerAliveInterval=15",
+            "-o", "ServerAliveCountMax=3",
             "-o", CONTROL_PATH,
             "-fN", host,
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(errfile)
-        .status()
+        .spawn()
         .map_err(|e| e.to_string())?;
-    if status.success() {
-        return Ok(());
+    match wait_limit(&mut master, CONNECT_LIMIT) {
+        Some(s) if s.success() => return Ok(()),
+        Some(_) => {}
+        None => return Err(format!("couldn't connect within {}s", CONNECT_LIMIT.as_secs())),
     }
     let mut err = String::new();
     let _ = File::open(&errpath).and_then(|mut f| f.read_to_string(&mut err));
@@ -126,11 +157,23 @@ fn run(host: &str, script: &str) -> Result<String, String> {
         .spawn()
         .map_err(|e| e.to_string())?;
     child.stdin.take().unwrap().write_all(script.as_bytes()).map_err(|e| e.to_string())?;
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    // read both pipes on their own threads so a full pipe can't stall the process
+    let read = |mut r: Box<dyn Read + Send>| {
+        thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = r.read_to_end(&mut buf);
+            String::from_utf8_lossy(&buf).into_owned()
+        })
+    };
+    let out_reader = read(Box::new(child.stdout.take().unwrap()));
+    let err_reader = read(Box::new(child.stderr.take().unwrap()));
+    if wait_limit(&mut child, RUN_LIMIT).is_none() {
+        return Err(format!("no answer within {}s, will retry", RUN_LIMIT.as_secs()));
+    }
+    let stdout = out_reader.join().unwrap_or_default();
+    let stderr = err_reader.join().unwrap_or_default();
     if !stdout.contains("@@") {
-        let err = String::from_utf8_lossy(&out.stderr);
-        return Err(last_line(&err).unwrap_or("no output").to_string());
+        return Err(last_line(&stderr).unwrap_or("no output").to_string());
     }
     Ok(stdout)
 }

@@ -14,14 +14,22 @@ fn main() {
         return;
     }
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("gpudash-notify");
-    let built = Command::new("swiftc")
-        .args(["-O", "-suppress-warnings", "notifier/main.swift", "-o"])
-        .arg(&out)
-        .status()
-        .is_ok_and(|s| s.success());
-    if built {
+    // `swiftc` comes with Xcode or the Command Line Tools (xcode-select --install);
+    // `xcrun` finds it even when it isn't on PATH.
+    let compile = |program: &str, pre: &[&str]| {
+        Command::new(program)
+            .args(pre)
+            .args(["-O", "-suppress-warnings", "notifier/main.swift", "-o"])
+            .arg(&out)
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    if compile("swiftc", &[]) || compile("xcrun", &["swiftc"]) {
         println!("cargo::rustc-cfg=notifier");
     } else {
-        println!("cargo::warning=swiftc not found: notifications will show the Script Editor icon");
+        println!(
+            "cargo::warning=Swift compiler not found, so notifications will show the Script Editor icon. \
+             Run `xcode-select --install`, then reinstall gpudash."
+        );
     }
 }

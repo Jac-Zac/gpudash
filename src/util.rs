@@ -64,15 +64,31 @@ pub fn bar(frac: f64, width: usize) -> Vec<Span<'static>> {
     ]
 }
 
+/// Gradient end points for the big bars. Both warm, but util leans pink and memory leans gold,
+/// so they're easy to tell apart.
+pub const UTIL_FROM: (u8, u8, u8) = (255, 125, 70); // orange
+pub const UTIL_TO: (u8, u8, u8) = (255, 60, 160); // hot pink
+pub const MEM_FROM: (u8, u8, u8) = (255, 215, 100); // gold
+pub const MEM_TO: (u8, u8, u8) = (255, 145, 95); // peach
+
+pub fn rgb(c: (u8, u8, u8)) -> Color {
+    Color::Rgb(c.0, c.1, c.2)
+}
+
+fn mix(a: (u8, u8, u8), b: (u8, u8, u8), f: f64) -> Color {
+    let m = |x: u8, y: u8| (x as f64 + (y as f64 - x as f64) * f).round() as u8;
+    Color::Rgb(m(a.0, b.0), m(a.1, b.1), m(a.2, b.2))
+}
+
 /// A big solid bar for the detail panel. Each cell is colored by its position along the
-/// gradient, so a full bar sweeps from blue to red. Partial cells use eighth blocks.
-pub fn big_bar(frac: f64, width: usize) -> Vec<Span<'static>> {
+/// gradient `from` → `to`, so a full bar shows the whole sweep. Partial cells use eighth blocks.
+pub fn big_bar(frac: f64, width: usize, from: (u8, u8, u8), to: (u8, u8, u8)) -> Vec<Span<'static>> {
     const PARTS: [&str; 8] = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"];
     let frac = frac.clamp(0.0, 1.0);
     let cells = frac * width as f64;
     let full = (cells.floor() as usize).min(width);
     let part = ((cells - full as f64) * 8.0).round() as usize;
-    let at = |i: usize| temp_color(35.0 + i as f64 / width.max(1) as f64 * 55.0);
+    let at = |i: usize| mix(from, to, i as f64 / width.saturating_sub(1).max(1) as f64);
     let mut spans: Vec<Span> = (0..full).map(|i| Span::styled("█", Style::new().fg(at(i)))).collect();
     let mut used = full;
     if full < width && part > 0 {

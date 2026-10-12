@@ -26,6 +26,7 @@ pub struct Cluster {
     pub fetched: Option<Instant>,
     pub error: Option<String>,
     pub loading: bool,
+    pub loading_since: Instant,
     /// job id -> (stdout, stderr) path patterns; kept on disk so logs of old jobs stay reachable
     pub outputs: HashMap<String, (String, String)>,
 }
@@ -137,6 +138,7 @@ impl App {
             fetched: None,
             error: None,
             loading: false,
+            loading_since: Instant::now(),
         });
         self.next_uid += 1;
     }
@@ -216,6 +218,7 @@ impl App {
                 continue;
             }
             c.loading = true;
+            c.loading_since = Instant::now();
             let (tx, host, uid) = (self.tx.clone(), c.host.clone(), c.uid);
             thread::spawn(move || {
                 let _ = tx.send(Msg::Jobs(uid, remote::fetch_jobs(&host)));
