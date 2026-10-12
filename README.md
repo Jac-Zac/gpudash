@@ -41,6 +41,9 @@ the 5 most recent per cluster; press `h` to see all of them, or none.
 
 - **Logs** — `enter` opens the job's output log, full screen and scrollable. While the job
   is running it keeps updating and stays at the end. `e` switches between stdout and stderr.
+  Logs are colored: if your program prints its own colors (rich, loguru, colored
+  tracebacks…) you see those; otherwise gpudash highlights timestamps, log levels, errors and
+  tracebacks, warnings, numbers, strings, paths, URLs, `key=value` pairs and progress bars.
 - **Shell** — `s` drops you into a shell in the job's folder. If the job is running, the
   shell is *inside the job* on its GPU node (via `srun --overlap`), so `nvidia-smi`, `htop`,
   etc. show your job. Exit the shell to come back to the dashboard.

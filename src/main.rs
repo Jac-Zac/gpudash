@@ -1,6 +1,7 @@
 //! gpudash — live terminal dashboard for your Slurm jobs across clusters.
 
 mod app;
+mod highlight;
 mod remote;
 mod ui;
 mod util;

@@ -5,6 +5,7 @@ use ratatui::widgets::{
     Block, BorderType, Cell, Clear, HighlightSpacing, Padding, Paragraph, Row, Sparkline, Table, TableState,
 };
 
+use crate::highlight;
 use crate::app::{App, Cluster, Ended, LogView, Popup, RECENT_ENDED};
 use crate::remote::Job;
 use crate::util::*;
@@ -379,22 +380,9 @@ fn draw_log(f: &mut Frame, app: &App, v: &LogView) {
     } else if n == 0 {
         vec![Line::from(dim("(log is empty)"))]
     } else {
-        lines[top..(top + inner_h).min(n)].iter().map(|l| Line::from(log_line(l))).collect()
+        lines[top..(top + inner_h).min(n)].iter().map(|l| highlight::line(l)).collect()
     };
     f.render_widget(Paragraph::new(body).block(block), area);
-}
-
-/// Light highlighting: errors red, warnings yellow.
-fn log_line(l: &str) -> Span<'static> {
-    let lower = l.to_lowercase();
-    let color = if lower.contains("error") || lower.contains("traceback") || lower.contains("exception") {
-        RED
-    } else if lower.contains("warn") {
-        YELLOW
-    } else {
-        TEXT
-    };
-    Span::styled(l.to_string(), Style::new().fg(color))
 }
 
 fn size(bytes: u64) -> String {

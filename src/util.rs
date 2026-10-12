@@ -175,7 +175,8 @@ pub fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// Clean one log line for display: keep what a terminal would show after '\r', drop ANSI codes.
+/// Clean one log line for display: keep what a terminal would show after '\r',
+/// keep color codes (ESC [ ... m), drop other escape sequences and control characters.
 pub fn clean_log_line(line: &str) -> String {
     let line = line.trim_end_matches('\r');
     let line = line.rsplit('\r').find(|s| !s.trim().is_empty()).unwrap_or("");
@@ -185,10 +186,17 @@ pub fn clean_log_line(line: &str) -> String {
         if c == '\x1b' {
             if chars.peek() == Some(&'[') {
                 chars.next();
+                let mut seq = String::new();
                 for c in chars.by_ref() {
                     if c.is_ascii_alphabetic() {
+                        if c == 'm' {
+                            out.push_str("\x1b[");
+                            out.push_str(&seq);
+                            out.push('m');
+                        }
                         break;
                     }
+                    seq.push(c);
                 }
             }
         } else if c == '\t' {
