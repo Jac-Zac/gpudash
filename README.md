@@ -49,7 +49,8 @@ It finds logs even after Slurm has forgotten the job.
 ![four of the built-in themes](assets/screenshots/themes.png)
 
 Six built-in themes (`default`, `light`, `nord`, `gruvbox`, `catppuccin-mocha`,
-`tokyo-night`), switchable live from the palette (`p` → *Theme*). Make your own by adding a
+`tokyo-night`). Pick one with `p` → *Theme*; moving through the list previews each theme
+live, `enter` keeps it and `esc` goes back. Make your own by adding a
 `.toml` file to `~/.config/gpudash/themes/`; see [Themes](#making-a-theme) below.
 
 ### And
@@ -67,6 +68,14 @@ You need [Rust](https://rustup.rs) and, on a Mac, Apple's Command Line Tools
 ```sh
 cargo install --git https://github.com/RollingRo11/gpudash
 ```
+
+**Updating:** pulling the repo isn't enough, reinstall to rebuild:
+
+```sh
+cargo install --git https://github.com/RollingRo11/gpudash --force   # or, in a clone: git pull && cargo install --path . --force
+```
+
+`gpudash --version` shows which commit you're running.
 
 On macOS this also builds a small notification app that puts the gpudash icon on
 notifications. It's set up the first time a notification is sent; click **Allow** when

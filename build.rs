@@ -10,6 +10,18 @@ fn main() {
     println!("cargo::rerun-if-changed=notifier/Info.plist");
     println!("cargo::rerun-if-changed=assets/gpudash.icns");
 
+    // the commit this was built from, for `gpudash --version`
+    let commit = Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|| "unknown commit".into());
+    println!("cargo::rustc-env=GPUDASH_COMMIT={commit}");
+    println!("cargo::rerun-if-changed=.git/HEAD");
+    println!("cargo::rerun-if-changed=.git/refs/heads");
+
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
     }

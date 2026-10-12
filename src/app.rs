@@ -74,6 +74,8 @@ pub struct App {
     cli_clusters: bool,
     next_uid: usize,
     pub paused: bool,
+    /// theme currently on screen (differs from config.theme while previewing in the palette)
+    pub theme_shown: String,
     pub palette: Option<Palette>,
     pub filter: String,
     pub filtering: bool,
@@ -111,6 +113,7 @@ impl App {
             cli_clusters,
             next_uid: 0,
             paused: false,
+            theme_shown: String::new(),
             palette: None,
             filter: String::new(),
             filtering: false,
@@ -200,7 +203,10 @@ impl App {
         self.config = config;
         self.apply_display();
         match crate::theme::apply(&self.config.theme) {
-            Ok(()) => self.say("config reloaded", false),
+            Ok(()) => {
+                self.theme_shown = self.config.theme.clone();
+                self.say("config reloaded", false)
+            }
             Err(e) => self.say(e, true),
         }
         self.refresh();
@@ -556,6 +562,7 @@ impl App {
             Cmd::Theme(name) => match crate::theme::apply(&name) {
                 Ok(()) => {
                     c.theme = name.clone();
+                    self.theme_shown = name.clone();
                     self.save(format!("theme: {name}"));
                 }
                 Err(e) => self.say(e, true),

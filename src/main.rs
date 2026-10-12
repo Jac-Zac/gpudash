@@ -21,7 +21,7 @@ use palette::{Act, Palette};
 const HELP: &str = "\
 gpudash — live dashboard for your Slurm jobs across clusters
 
-usage: gpudash [-n SECONDS] [HOST ...]
+usage: gpudash [-n SECONDS] [HOST ...]   (gpudash --version shows the build)
 
   HOST        ssh host names to watch (default: the clusters in the config file)
   -n SECONDS  how often to refresh (overrides the config for this run)
@@ -41,6 +41,10 @@ fn main() -> std::io::Result<()> {
     let mut hosts = Vec::new();
     while let Some(a) = args.next() {
         match a.as_str() {
+            "-V" | "--version" => {
+                println!("gpudash {} ({})", env!("CARGO_PKG_VERSION"), env!("GPUDASH_COMMIT"));
+                return Ok(());
+            }
             "-h" | "--help" => {
                 print!("{HELP}");
                 return Ok(());
@@ -66,6 +70,7 @@ fn main() -> std::io::Result<()> {
     theme::write_examples();
     let theme_error = theme::apply(&config.theme).err();
     let mut app = App::new(config, hosts);
+    app.theme_shown = app.config.theme.clone();
     if let Some(e) = theme_error {
         app.say(e, true);
     }
@@ -224,6 +229,31 @@ fn on_key(app: &mut App, k: KeyEvent) -> Next {
 }
 
 fn palette_key(app: &mut App, k: KeyEvent) -> Next {
+    let next = palette_key_inner(app, k);
+    preview_theme(app);
+    next
+}
+
+/// While the Theme list is open, show the highlighted theme; otherwise show the saved one.
+fn preview_theme(app: &mut App) {
+    let highlighted = app.palette.as_ref().and_then(|p| p.stack.last()).and_then(|l| {
+        if l.menu != palette::Menu::Theme {
+            return None;
+        }
+        let items = palette::search(app, l.menu, &l.query);
+        let last = items.len().checked_sub(1)?;
+        match items.into_iter().nth(l.sel.min(last))?.act {
+            Act::Run(palette::Cmd::Theme(name)) => Some(name),
+            _ => None,
+        }
+    });
+    let want = highlighted.unwrap_or_else(|| app.config.theme.clone());
+    if want != app.theme_shown && theme::apply(&want).is_ok() {
+        app.theme_shown = want;
+    }
+}
+
+fn palette_key_inner(app: &mut App, k: KeyEvent) -> Next {
     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
     let p = app.palette.as_mut().unwrap();
 
@@ -281,7 +311,17 @@ fn palette_key(app: &mut App, k: KeyEvent) -> Next {
         KeyCode::Enter => {
             let Some(it) = items.into_iter().nth(sel.min(last)) else { return Next::Continue };
             match it.act {
-                Act::Open(menu) => p.open(menu),
+                Act::Open(menu) => {
+                    p.open(menu);
+                    // start the theme list on the theme in use
+                    if menu == palette::Menu::Theme {
+                        let current = &app.config.theme;
+                        let pos = theme::available().iter().position(|n| n == current).unwrap_or(0);
+                        if let Some(l) = app.palette.as_mut().and_then(|p| p.level()) {
+                            l.sel = pos;
+                        }
+                    }
+                }
                 Act::Run(cmd) => {
                     app.palette = None;
                     return app.run(cmd);
