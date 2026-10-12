@@ -1,0 +1,28 @@
+# Catppuccin Mocha (https://catppuccin.com). Colors are "#rrggbb".
+
+background = "#1e1e2e"
+text = "#cdd6f4"
+dim = "#7f849c"
+faint = "#45475a"
+accent = "#89b4fa"
+selection = "#313244"
+track = "#313244"
+
+running = "#a6e3a1"
+queued = "#f9e2af"
+done = "#94e2d5"
+failed = "#f38ba8"
+warning = "#fab387"
+
+temperature = ["#74c7ec", "#a6e3a1", "#f9e2af", "#fab387", "#f38ba8"]
+util = ["#fab387", "#f5c2e7"]
+memory = ["#f9e2af", "#eba0ac"]
+
+[log]
+number = "#cba6f7"
+string = "#a6e3a1"
+path = "#89dceb"
+key = "#b4befe"
+error = "#f38ba8"
+warning = "#f9e2af"
+bar = "#a6e3a1"

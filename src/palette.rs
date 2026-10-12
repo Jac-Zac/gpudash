@@ -1,4 +1,4 @@
-//! Command palette (press k): every action and setting in one searchable list.
+//! Command palette (press p): every action and setting in one searchable list.
 
 use crate::app::App;
 use crate::config::{ClockFormat, Ended, TempUnit};
@@ -11,6 +11,7 @@ pub enum Menu {
     Recent,
     Unit,
     Clock,
+    Theme,
     RemoveCluster,
     PrefixCluster,
 }
@@ -24,6 +25,7 @@ impl Menu {
             Menu::Recent => "How many recent ended jobs",
             Menu::Unit => "Temperature unit",
             Menu::Clock => "Clock",
+            Menu::Theme => "Theme",
             Menu::RemoveCluster => "Remove cluster",
             Menu::PrefixCluster => "Set folder prefix",
         }
@@ -53,6 +55,8 @@ pub enum Cmd {
     Unit(TempUnit),
     Clock(ClockFormat),
     ToggleGraph,
+    Theme(String),
+    OpenThemes,
     // clusters
     AddCluster,
     RemoveCluster(usize),
@@ -131,6 +135,8 @@ pub fn items(app: &App, menu: Menu) -> Vec<Item> {
                 item("setting", "Temperature unit…", if c.temperature_unit == TempUnit::C { "°C" } else { "°F" }, Open(Menu::Unit)),
                 item("setting", "Clock…", if c.clock == ClockFormat::H12 { "12-hour" } else { "24-hour" }, Open(Menu::Clock)),
                 item("setting", "Temperature graph", on_off(c.temperature_graph), Run(Cmd::ToggleGraph)),
+                item("setting", "Theme…", c.theme.clone(), Open(Menu::Theme)),
+                item("setting", "Open themes folder", "", Run(Cmd::OpenThemes)),
                 item("cluster", "Add cluster…", "", Run(Cmd::AddCluster)),
             ]);
             if !app.clusters.is_empty() {
@@ -170,6 +176,13 @@ pub fn items(app: &App, menu: Menu) -> Vec<Item> {
             item("", "12-hour (08:24pm)", tick(c.clock == ClockFormat::H12), Run(Cmd::Clock(ClockFormat::H12))),
             item("", "24-hour (20:24)", tick(c.clock == ClockFormat::H24), Run(Cmd::Clock(ClockFormat::H24))),
         ],
+        Menu::Theme => crate::theme::available()
+            .into_iter()
+            .map(|name| {
+                let hint = tick(c.theme == name);
+                item("", name.clone(), hint, Run(Cmd::Theme(name)))
+            })
+            .collect(),
         Menu::RemoveCluster => app
             .clusters
             .iter()

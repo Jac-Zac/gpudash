@@ -11,13 +11,6 @@ use regex::Regex;
 
 use crate::util::*;
 
-const NUMBER: Color = Color::Rgb(215, 160, 255);
-const STRING: Color = Color::Rgb(150, 215, 140);
-const PATH: Color = Color::Rgb(110, 200, 215);
-const KEY: Color = Color::Rgb(140, 160, 200);
-const ERR_TEXT: Color = Color::Rgb(255, 150, 150);
-const WARN_TEXT: Color = Color::Rgb(240, 215, 150);
-const BAR: Color = Color::Rgb(80, 220, 140);
 
 static TOKENS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(concat!(
@@ -53,13 +46,13 @@ pub fn line(text: &str) -> Line<'static> {
 
 fn plain(text: &str) -> Line<'static> {
     let base = if ERROR_LINE.is_match(text) {
-        Style::new().fg(ERR_TEXT)
+        Style::new().fg(t().log_error)
     } else if WARN_LINE.is_match(text) {
-        Style::new().fg(WARN_TEXT)
+        Style::new().fg(t().log_warning)
     } else if TRACE_FRAME.is_match(text) {
-        Style::new().fg(DIM)
+        Style::new().fg(t().dim)
     } else {
-        Style::new().fg(TEXT)
+        Style::new().fg(t().text)
     };
 
     let mut spans = Vec::new();
@@ -70,29 +63,29 @@ fn plain(text: &str) -> Line<'static> {
             spans.push(Span::styled(text[last..m.start()].to_string(), base));
         }
         let style = if caps.name("ts").is_some() {
-            Style::new().fg(DIM)
+            Style::new().fg(t().dim)
         } else if caps.name("err").is_some() {
-            Style::new().fg(RED).bold()
+            Style::new().fg(t().failed).bold()
         } else if caps.name("warn").is_some() {
-            Style::new().fg(YELLOW).bold()
+            Style::new().fg(t().queued).bold()
         } else if caps.name("info").is_some() {
-            Style::new().fg(ACCENT)
+            Style::new().fg(t().accent)
         } else if caps.name("debug").is_some() {
-            Style::new().fg(DIM)
+            Style::new().fg(t().dim)
         } else if caps.name("ok").is_some() {
-            Style::new().fg(GREEN)
+            Style::new().fg(t().running)
         } else if caps.name("url").is_some() {
-            Style::new().fg(ACCENT).underlined()
+            Style::new().fg(t().accent).underlined()
         } else if caps.name("str").is_some() {
-            Style::new().fg(STRING)
+            Style::new().fg(t().log_string)
         } else if caps.name("path").is_some() {
-            Style::new().fg(PATH)
+            Style::new().fg(t().log_path)
         } else if caps.name("key").is_some() {
-            Style::new().fg(KEY)
+            Style::new().fg(t().log_key)
         } else if caps.name("num").is_some() {
-            Style::new().fg(NUMBER)
+            Style::new().fg(t().log_number)
         } else if caps.name("bar").is_some() {
-            Style::new().fg(BAR)
+            Style::new().fg(t().log_bar)
         } else {
             base
         };
@@ -108,7 +101,7 @@ fn plain(text: &str) -> Line<'static> {
 /// Apply SGR color codes (ESC [ ... m) the way a terminal would.
 fn ansi(text: &str) -> Line<'static> {
     let mut spans = Vec::new();
-    let mut style = Style::new().fg(TEXT);
+    let mut style = Style::new().fg(t().text);
     let mut buf = String::new();
     let mut rest = text;
     while let Some(i) = rest.find("\x1b[") {
@@ -143,7 +136,7 @@ fn apply_sgr(mut style: Style, params: &str) -> Style {
     while i < codes.len() {
         let c = codes[i];
         match c {
-            0 => style = Style::new().fg(TEXT),
+            0 => style = Style::new().fg(t().text),
             1 => style = style.add_modifier(Modifier::BOLD),
             2 => style = style.add_modifier(Modifier::DIM),
             3 => style = style.add_modifier(Modifier::ITALIC),
@@ -154,7 +147,7 @@ fn apply_sgr(mut style: Style, params: &str) -> Style {
             24 => style = style.remove_modifier(Modifier::UNDERLINED),
             27 => style = style.remove_modifier(Modifier::REVERSED),
             30..=37 => style = style.fg(Color::Indexed((c - 30) as u8)),
-            39 => style = style.fg(TEXT),
+            39 => style = style.fg(t().text),
             40..=47 => style = style.bg(Color::Indexed((c - 40) as u8)),
             49 => style.bg = None,
             90..=97 => style = style.fg(Color::Indexed((c - 90 + 8) as u8)),
@@ -196,20 +189,20 @@ mod tests {
     #[test]
     fn traceback_lines_are_red() {
         let l = line("ValueError: shapes do not match");
-        assert_eq!(color_of(&l, "shapes"), Some(ERR_TEXT));
+        assert_eq!(color_of(&l, "shapes"), Some(t().log_error));
         let l = line("torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.00 GiB");
-        assert_eq!(color_of(&l, "Tried"), Some(ERR_TEXT));
+        assert_eq!(color_of(&l, "Tried"), Some(t().log_error));
     }
 
     #[test]
     fn levels_and_tokens() {
         let l = line("2026-10-12 09:26:15,180 INFO loss=0.25 saved to /scratch/me/ckpt/step_100.pt");
-        assert_eq!(color_of(&l, "2026-10-12"), Some(DIM));
-        assert_eq!(color_of(&l, "INFO"), Some(ACCENT));
-        assert_eq!(color_of(&l, "0.25"), Some(NUMBER));
-        assert_eq!(color_of(&l, "/scratch"), Some(PATH));
+        assert_eq!(color_of(&l, "2026-10-12"), Some(t().dim));
+        assert_eq!(color_of(&l, "INFO"), Some(t().accent));
+        assert_eq!(color_of(&l, "0.25"), Some(t().log_number));
+        assert_eq!(color_of(&l, "/scratch"), Some(t().log_path));
         let l = line("WARNING something odd");
-        assert_eq!(color_of(&l, "odd"), Some(WARN_TEXT));
+        assert_eq!(color_of(&l, "odd"), Some(t().log_warning));
     }
 
     #[test]

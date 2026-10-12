@@ -15,6 +15,8 @@ use crate::util::*;
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const TOAST_SECS: u64 = 4;
+/// cells in the time-used bar of the job table
+const TIME_BAR: usize = 8;
 
 fn spinner(tick: usize) -> Span<'static> {
     let color = temp_color(30.0 + ((tick * 2) % 60) as f64);
@@ -22,19 +24,19 @@ fn spinner(tick: usize) -> Span<'static> {
 }
 
 fn dim(s: impl Into<String>) -> Span<'static> {
-    Span::styled(s.into(), Style::new().fg(DIM))
+    Span::styled(s.into(), Style::new().fg(t().dim))
 }
 
 fn text(s: impl Into<String>) -> Span<'static> {
-    Span::styled(s.into(), Style::new().fg(TEXT))
+    Span::styled(s.into(), Style::new().fg(t().text))
 }
 
 fn key(s: &'static str) -> Span<'static> {
-    Span::styled(s, Style::new().fg(ACCENT))
+    Span::styled(s, Style::new().fg(t().accent))
 }
 
 fn panel() -> Block<'static> {
-    Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(FAINT))
+    Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(t().faint))
 }
 
 /// Running jobs get two rows per GPU (util and memory bars), up to 4 GPUs.
@@ -49,7 +51,18 @@ fn detail_height(app: &App) -> u16 {
     }
 }
 
+/// Clear an area for a popup, keeping the theme's background.
+fn clear(f: &mut Frame, area: Rect) {
+    f.render_widget(Clear, area);
+    if let Some(bg) = t().background {
+        f.render_widget(Block::new().style(Style::new().bg(bg).fg(t().text)), area);
+    }
+}
+
 pub fn draw(f: &mut Frame, app: &App) {
+    if let Some(bg) = t().background {
+        f.render_widget(Block::new().style(Style::new().bg(bg).fg(t().text)), f.area());
+    }
     let [head, body, detail, foot] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Fill(1),
@@ -86,10 +99,10 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         .map(|j| j.gpus.len())
         .sum();
     let left = Line::from(vec![
-        Span::styled(" gpudash ", Style::new().fg(Color::Black).bg(ACCENT).bold()),
-        Span::styled(format!("  {running} running"), Style::new().fg(GREEN)),
+        Span::styled(" gpudash ", Style::new().fg(t().background.unwrap_or(Color::Black)).bg(t().accent).bold()),
+        Span::styled(format!("  {running} running"), Style::new().fg(t().running)),
         dim(" · "),
-        Span::styled(format!("{queued} queued"), Style::new().fg(YELLOW)),
+        Span::styled(format!("{queued} queued"), Style::new().fg(t().queued)),
         dim(format!(" · {gpus} GPUs in use")),
     ]);
     let mut right = vec![];
@@ -99,7 +112,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     if app.loading() {
         right.extend([spinner(app.tick), dim(" refreshing ")]);
     } else if app.paused {
-        right.push(Span::styled("‖ paused ", Style::new().fg(YELLOW)));
+        right.push(Span::styled("‖ paused ", Style::new().fg(t().queued)));
     } else {
         let left = app.interval().saturating_sub(app.last_refresh.elapsed()).as_secs();
         let left = if left >= 60 { format!("{}m{:02}s", left / 60, left % 60) } else { format!("{left}s") };
@@ -127,7 +140,7 @@ fn draw_clusters(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_cluster(f: &mut Frame, area: Rect, app: &App, ci: usize, c: &Cluster, jobs: &[&Job]) {
-    let mut title = vec![Span::styled(format!(" {} ", c.host), Style::new().fg(TEXT).bold())];
+    let mut title = vec![Span::styled(format!(" {} ", c.host), Style::new().fg(t().text).bold())];
     if let Some(all) = &c.jobs {
         let r = all.iter().filter(|j| j.running()).count();
         let q = all.iter().filter(|j| !j.running() && !j.finished()).count();
@@ -152,16 +165,16 @@ fn draw_cluster(f: &mut Frame, area: Rect, app: &App, ci: usize, c: &Cluster, jo
     }
     let mut block = panel().title(Line::from(title));
     if let Some(e) = &c.error {
-        block = block.title_bottom(Line::from(Span::styled(format!(" ⚠ {e} "), Style::new().fg(RED))));
+        block = block.title_bottom(Line::from(Span::styled(format!(" ⚠ {e} "), Style::new().fg(t().failed))));
     }
-    if let Some(t) = c.fetched {
-        let ago = t.elapsed().as_secs();
-        block = block.title_top(Line::from(Span::styled(format!(" {ago}s ago "), Style::new().fg(FAINT))).right_aligned());
+    if let Some(when) = c.fetched {
+        let ago = when.elapsed().as_secs();
+        block = block.title_top(Line::from(Span::styled(format!(" {ago}s ago "), Style::new().fg(t().faint))).right_aligned());
     }
 
     if jobs.is_empty() {
         let msg = match (&c.jobs, c.loading) {
-            (None, true) => " connecting…",
+            (None, true) => " waiting for Slurm…",
             (None, false) => "",
             (Some(_), _) if !app.filter.is_empty() => " nothing matches the filter",
             _ => " no jobs",
@@ -171,14 +184,14 @@ fn draw_cluster(f: &mut Frame, area: Rect, app: &App, ci: usize, c: &Cluster, jo
     }
 
     let since = c.fetched.map_or(0, |t| t.elapsed().as_secs());
-    let header = Row::new(["id", "name", "state", "gpu", "time", "temp / start", "folder"]).style(Style::new().fg(DIM));
+    let header = Row::new(["id", "name", "state", "gpu", "time", "temp / start", "folder"]).style(Style::new().fg(t().dim));
     let rows: Vec<Row> = jobs.iter().map(|j| job_row(j, &c.prefix, since)).collect();
     let widths = [
         Constraint::Length(10),
         Constraint::Length(22),
         Constraint::Length(7),
         Constraint::Length(8),
-        Constraint::Length(17),
+        Constraint::Length(TIME_BAR as u16 + 11),
         Constraint::Length(23),
         Constraint::Fill(1),
     ];
@@ -191,8 +204,8 @@ fn draw_cluster(f: &mut Frame, area: Rect, app: &App, ci: usize, c: &Cluster, jo
     let table = Table::new(rows, widths)
         .header(header)
         .block(block)
-        .row_highlight_style(Style::new().bg(SEL_BG))
-        .highlight_symbol(Span::styled("▌", Style::new().fg(ACCENT)))
+        .row_highlight_style(Style::new().bg(t().selection))
+        .highlight_symbol(Span::styled("▌", Style::new().fg(t().accent)))
         .highlight_spacing(HighlightSpacing::Always);
     f.render_stateful_widget(table, area, &mut state);
 }
@@ -201,7 +214,7 @@ fn job_row(j: &Job, prefix: &str, since: u64) -> Row<'static> {
     let (dot, label, color) = state_look(&j.state);
     let state = Line::from(Span::styled(format!("{dot} {label}"), Style::new().fg(color)));
     let ended = j.finished();
-    let name_color = if ended { DIM } else { TEXT };
+    let name_color = if ended { t().dim } else { t().text };
 
     let gpu = match j.gpus.first() {
         Some(g) => format!("{}× {}", j.gpus.len(), g.name),
@@ -214,14 +227,14 @@ fn job_row(j: &Job, prefix: &str, since: u64) -> Row<'static> {
             (Some(u), Some(l)) if l > 0 => u as f64 / l as f64,
             _ => 0.0,
         };
-        let mut spans = bar(frac, 5);
+        let mut spans = bar(frac, TIME_BAR);
         spans.push(text(format!(" {}", dur(used))));
         spans.push(dim(format!("/{}", dur(j.limit))));
         Line::from(spans)
     } else if ended {
-        Line::from(dim(format!("      {}/{}", dur(j.used), dur(j.limit))))
+        Line::from(dim(format!("{:w$}{}/{}", "", dur(j.used), dur(j.limit), w = TIME_BAR + 1)))
     } else {
-        Line::from(dim(format!("      {}", dur(j.limit))))
+        Line::from(dim(format!("{:w$}{}", "", dur(j.limit), w = TIME_BAR + 1)))
     };
 
     let last = if !j.gpus.is_empty() {
@@ -248,7 +261,7 @@ fn job_row(j: &Job, prefix: &str, since: u64) -> Row<'static> {
         Line::from(text(start_text(s)))
     } else {
         let why = if matches!(j.reason.as_str(), "Priority" | "None" | "Resources") { "" } else { &j.reason };
-        Line::from(vec![dim("? "), Span::styled(why.to_string(), Style::new().fg(FAINT))])
+        Line::from(vec![dim("? "), Span::styled(why.to_string(), Style::new().fg(t().faint))])
     };
 
     Row::new(vec![
@@ -271,7 +284,7 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
     let (dot, _, color) = state_look(&j.state);
     let block = block.title(Line::from(vec![
         Span::styled(format!(" {dot} "), Style::new().fg(color)),
-        Span::styled(format!("{} ", j.name), Style::new().fg(TEXT).bold()),
+        Span::styled(format!("{} ", j.name), Style::new().fg(t().text).bold()),
         dim(format!("{} · {} ", j.id, c.host)),
     ]));
     let label = |s: &'static str| dim(format!("{s:<8}"));
@@ -308,19 +321,19 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
             let tag = if many { format!("gpu {i}") } else { "gpu".to_string() };
             let mut util = vec![
                 dim(format!("{tag:<8}")),
-                Span::styled(format!("{:<7}", g.name), Style::new().fg(TEXT).bold()),
+                Span::styled(format!("{:<7}", g.name), Style::new().fg(t().text).bold()),
                 Span::styled(format!("{:<7}", temp_text(g.temp)), Style::new().fg(temp_color(g.temp as f64)).bold()),
-                Span::styled("util  ", Style::new().fg(rgb(UTIL_FROM))),
+                Span::styled("util  ", Style::new().fg(rgb(t().util[0]))),
             ];
-            util.extend(big_bar(g.util as f64 / 100.0, width, UTIL_FROM, UTIL_TO));
-            util.push(Span::styled(format!(" {:>4}%", g.util), Style::new().fg(rgb(UTIL_TO)).bold()));
+            util.extend(big_bar(g.util as f64 / 100.0, width, t().util[0], t().util[1]));
+            util.push(Span::styled(format!(" {:>4}%", g.util), Style::new().fg(rgb(t().util[1])).bold()));
             lines.push(Line::from(util));
 
-            let mut mem = vec![dim(format!("{:<22}", "")), Span::styled("mem   ", Style::new().fg(rgb(MEM_FROM)))];
-            mem.extend(big_bar(g.mem_used as f64 / g.mem_total.max(1) as f64, width, MEM_FROM, MEM_TO));
+            let mut mem = vec![dim(format!("{:<22}", "")), Span::styled("mem   ", Style::new().fg(rgb(t().memory[0])))];
+            mem.extend(big_bar(g.mem_used as f64 / g.mem_total.max(1) as f64, width, t().memory[0], t().memory[1]));
             mem.push(Span::styled(
                 format!(" {:>3.0}/{:.0} GB", g.mem_used as f64 / 1024.0, g.mem_total as f64 / 1024.0),
-                Style::new().fg(rgb(MEM_TO)).bold(),
+                Style::new().fg(rgb(t().memory[1])).bold(),
             ));
             lines.push(Line::from(mem));
         }
@@ -358,7 +371,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     if app.filtering || !app.filter.is_empty() {
         let mut spans = vec![key(" /"), text(app.filter.clone())];
         if app.filtering {
-            spans.push(Span::styled("█", Style::new().fg(ACCENT)));
+            spans.push(Span::styled("█", Style::new().fg(t().accent)));
             spans.push(dim("   enter keep · esc clear"));
         } else {
             spans.push(dim("   (esc to clear)"));
@@ -367,7 +380,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     } else {
         let hints = Line::from(vec![
             key(" ↑↓"), dim(" move  "),
-            key("k"), dim(" commands  "),
+            key("p"), dim(" commands  "),
             key("enter"), dim(" log  "),
             key("s"), dim(" shell  "),
             key("x"), dim(" cancel  "),
@@ -379,7 +392,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     }
     if let Some((msg, err, when)) = &app.toast {
         if when.elapsed().as_secs() < TOAST_SECS {
-            let color = if *err { RED } else { GREEN };
+            let color = if *err { t().failed } else { t().running };
             let line = Line::from(Span::styled(format!("{msg} "), Style::new().fg(color))).right_aligned();
             f.render_widget(Paragraph::new(line), area);
         }
@@ -388,11 +401,11 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
 
 fn draw_log(f: &mut Frame, app: &App, v: &LogView) {
     let area = f.area();
-    f.render_widget(Clear, area);
+    clear(f, area);
     let c = &app.clusters[v.ci];
     let path = v.log.as_ref().map_or(String::new(), |l| format!("{} · {}", shorten(&l.path, 60), size(l.size)));
     let mut title = vec![
-        Span::styled(format!(" {} ", v.name), Style::new().fg(TEXT).bold()),
+        Span::styled(format!(" {} ", v.name), Style::new().fg(t().text).bold()),
         dim(format!("{} · {} · {} ", v.id, c.host, if v.stderr { "stderr" } else { "stdout" })),
     ];
     if v.loading {
@@ -419,7 +432,7 @@ fn draw_log(f: &mut Frame, app: &App, v: &LogView) {
         .title_bottom(Line::from(dim(format!(" {position} "))).right_aligned());
 
     let body: Vec<Line> = if let Some(e) = &v.error {
-        vec![Line::from(Span::styled(e.clone(), Style::new().fg(RED)))]
+        vec![Line::from(Span::styled(e.clone(), Style::new().fg(t().failed)))]
     } else if v.log.is_none() {
         vec![Line::from(dim("loading…"))]
     } else if n == 0 {
@@ -452,42 +465,42 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
 
 fn draw_help(f: &mut Frame) {
     let rows = [
-        ("↑ ↓  j", "move"),
-        ("k  :", "command palette: every action and setting"),
+        ("↑ ↓  j k", "move"),
+        ("p  :", "command palette: every action and setting"),
         ("g G", "first / last job"),
-        ("enter  l", "open the job's log"),
+        ("enter  l", "open the job's log (h or esc to go back)"),
         ("s", "shell into the job (its GPU node if running)"),
         ("x", "cancel the job"),
         ("y", "copy the job id"),
         ("/", "filter by name, folder or id"),
-        ("h", "ended jobs: recent → all from 24h → hidden"),
+        ("e", "ended jobs: recent → all from 24h → hidden"),
         ("n", "turn Mac notifications on / off"),
         ("r", "refresh now"),
         ("q  esc", "quit"),
     ];
     let lines: Vec<Line> = rows
         .iter()
-        .map(|(k, d)| Line::from(vec![Span::styled(format!("{k:<12}"), Style::new().fg(ACCENT)), text(*d)]))
+        .map(|(k, d)| Line::from(vec![Span::styled(format!("{k:<12}"), Style::new().fg(t().accent)), text(*d)]))
         .collect();
     let area = centered(f.area(), 66, lines.len() as u16 + 4);
-    f.render_widget(Clear, area);
+    clear(f, area);
     let block = panel()
-        .title(Span::styled(" keys ", Style::new().fg(TEXT).bold()))
+        .title(Span::styled(" keys ", Style::new().fg(t().text).bold()))
         .padding(Padding::uniform(1));
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn draw_confirm(f: &mut Frame, host: &str, id: &str, name: &str) {
     let area = centered(f.area(), 52, 7);
-    f.render_widget(Clear, area);
+    clear(f, area);
     let lines = vec![
-        Line::from(vec![text("Cancel "), Span::styled(name.to_string(), Style::new().fg(TEXT).bold()), text("?")]),
+        Line::from(vec![text("Cancel "), Span::styled(name.to_string(), Style::new().fg(t().text).bold()), text("?")]),
         Line::from(dim(format!("job {id} on {host}"))),
         Line::from(""),
         Line::from(vec![key("y"), dim(" yes, cancel it    "), key("any other key"), dim(" no")]),
     ];
     let block = panel()
-        .border_style(Style::new().fg(RED))
+        .border_style(Style::new().fg(t().failed))
         .padding(Padding::horizontal(1));
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
@@ -495,18 +508,18 @@ fn draw_confirm(f: &mut Frame, host: &str, id: &str, name: &str) {
 fn draw_palette(f: &mut Frame, app: &App, p: &Palette) {
     if let Some(prompt) = &p.prompt {
         let area = centered(f.area(), 64, 7);
-        f.render_widget(Clear, area);
+        clear(f, area);
         let block = panel()
-            .border_style(Style::new().fg(ACCENT))
-            .title(Span::styled(format!(" {} ", prompt.title), Style::new().fg(TEXT).bold()))
+            .border_style(Style::new().fg(t().accent))
+            .title(Span::styled(format!(" {} ", prompt.title), Style::new().fg(t().text).bold()))
             .title_bottom(Line::from(vec![key(" enter"), dim(" save  "), key("esc"), dim(" cancel ")]))
             .padding(Padding::horizontal(1));
         let lines = vec![
             Line::from(""),
             Line::from(vec![
-                Span::styled("› ", Style::new().fg(ACCENT)),
+                Span::styled("› ", Style::new().fg(t().accent)),
                 text(prompt.text.clone()),
-                Span::styled("█", Style::new().fg(ACCENT)),
+                Span::styled("█", Style::new().fg(t().accent)),
             ]),
             Line::from(""),
             Line::from(dim(prompt.help.clone())),
@@ -517,11 +530,11 @@ fn draw_palette(f: &mut Frame, app: &App, p: &Palette) {
 
     let Some(level) = p.stack.last() else { return };
     let area = centered(f.area(), 72, 22);
-    f.render_widget(Clear, area);
+    clear(f, area);
     let crumbs: Vec<&str> = p.stack.iter().map(|l| l.menu.title()).collect();
     let block = panel()
-        .border_style(Style::new().fg(ACCENT))
-        .title(Span::styled(format!(" {} ", crumbs.join(" › ")), Style::new().fg(TEXT).bold()))
+        .border_style(Style::new().fg(t().accent))
+        .title(Span::styled(format!(" {} ", crumbs.join(" › ")), Style::new().fg(t().text).bold()))
         .title_bottom(Line::from(vec![
             key(" ↑↓"), dim(" choose  "),
             key("enter"), dim(" run  "),
@@ -532,13 +545,13 @@ fn draw_palette(f: &mut Frame, app: &App, p: &Palette) {
     let [input, gap, list_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
 
-    let mut input_line = vec![Span::styled(" › ", Style::new().fg(ACCENT)), text(level.query.clone())];
-    input_line.push(Span::styled("█", Style::new().fg(ACCENT)));
+    let mut input_line = vec![Span::styled(" › ", Style::new().fg(t().accent)), text(level.query.clone())];
+    input_line.push(Span::styled("█", Style::new().fg(t().accent)));
     if level.query.is_empty() {
         input_line.push(dim(" type to search"));
     }
     f.render_widget(Paragraph::new(Line::from(input_line)), input);
-    f.render_widget(Paragraph::new(Span::styled("─".repeat(gap.width as usize), Style::new().fg(FAINT))), gap);
+    f.render_widget(Paragraph::new(Span::styled("─".repeat(gap.width as usize), Style::new().fg(t().faint))), gap);
 
     let items: Vec<palette::Item> =
         palette::search(app, level.menu, &level.query);
@@ -556,7 +569,7 @@ fn draw_palette(f: &mut Frame, app: &App, p: &Palette) {
             let used = 1 + group.chars().count() + it.label.chars().count() + arrow.chars().count();
             let hint = format!("{} ", it.hint);
             let pad = width.saturating_sub(used + hint.chars().count());
-            let hint_color = if it.hint == "on" || it.hint == "✓" { GREEN } else { DIM };
+            let hint_color = if it.hint == "on" || it.hint == "✓" { t().running } else { t().dim };
             ListItem::new(Line::from(vec![
                 dim(format!(" {group}")),
                 text(it.label.clone()),
@@ -569,7 +582,7 @@ fn draw_palette(f: &mut Frame, app: &App, p: &Palette) {
     let mut state = ListState::default();
     state.select(Some(level.sel.min(items.len() - 1)));
     let list = List::new(rows)
-        .highlight_style(Style::new().bg(SEL_BG))
+        .highlight_style(Style::new().bg(t().selection))
         .highlight_symbol("▌")
         .highlight_spacing(HighlightSpacing::Always);
     f.render_stateful_widget(list, list_area, &mut state);

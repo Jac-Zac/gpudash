@@ -6,17 +6,8 @@ use chrono::{DateTime, FixedOffset, Local, Utc};
 use ratatui::style::{Color, Style};
 use ratatui::text::Span;
 
-pub const DIM: Color = Color::Rgb(110, 115, 130);
-pub const FAINT: Color = Color::Rgb(60, 64, 76);
-pub const TEXT: Color = Color::Rgb(215, 220, 230);
-pub const GREEN: Color = Color::Rgb(80, 220, 140);
-pub const SOFT_GREEN: Color = Color::Rgb(90, 165, 125);
-pub const YELLOW: Color = Color::Rgb(240, 200, 80);
-pub const ORANGE: Color = Color::Rgb(255, 150, 60);
-pub const RED: Color = Color::Rgb(255, 80, 80);
-pub const ACCENT: Color = Color::Rgb(120, 170, 255);
-pub const SEL_BG: Color = Color::Rgb(38, 42, 54);
-pub const TRACK: Color = Color::Rgb(44, 48, 60);
+/// The active color theme (see theme.rs).
+pub use crate::theme::t;
 
 /// Display preferences read by the formatting helpers below (set from the config).
 pub static CLOCK_24H: AtomicBool = AtomicBool::new(false);
@@ -30,20 +21,15 @@ pub fn temp_text(celsius: u32) -> String {
     }
 }
 
-/// temperature (°C) -> blue, green, yellow, orange, red
+/// temperature (°C) -> the theme's cool-to-hot colors
 pub fn temp_color(t: f64) -> Color {
-    const STOPS: [(f64, (u8, u8, u8)); 5] = [
-        (30.0, (90, 160, 255)),
-        (50.0, (80, 220, 140)),
-        (65.0, (240, 220, 80)),
-        (78.0, (255, 140, 50)),
-        (88.0, (255, 50, 60)),
-    ];
-    let rgb = |c: (u8, u8, u8)| Color::Rgb(c.0, c.1, c.2);
-    if t <= STOPS[0].0 {
-        return rgb(STOPS[0].1);
+    const AT: [f64; 5] = [30.0, 50.0, 65.0, 78.0, 88.0];
+    let colors = crate::theme::t().temperature;
+    let stops: [(f64, (u8, u8, u8)); 5] = std::array::from_fn(|i| (AT[i], colors[i]));
+    if t <= stops[0].0 {
+        return rgb(stops[0].1);
     }
-    for w in STOPS.windows(2) {
+    for w in stops.windows(2) {
         let ((t0, c0), (t1, c1)) = (w[0], w[1]);
         if t <= t1 {
             let f = (t - t0) / (t1 - t0);
@@ -51,25 +37,19 @@ pub fn temp_color(t: f64) -> Color {
             return Color::Rgb(mix(c0.0, c1.0), mix(c0.1, c1.1), mix(c0.2, c1.2));
         }
     }
-    rgb(STOPS[4].1)
+    rgb(stops[4].1)
 }
 
 /// fraction 0..1 drawn as a bar, colored along the temperature gradient
 pub fn bar(frac: f64, width: usize) -> Vec<Span<'static>> {
     let frac = frac.clamp(0.0, 1.0);
-    let filled = (frac * width as f64).round() as usize;
+    // anything started gets at least one cell, so short-but-running jobs don't look empty
+    let filled = ((frac * width as f64).round() as usize).max(usize::from(frac > 0.0)).min(width);
     vec![
         Span::styled("━".repeat(filled), Style::new().fg(temp_color(40.0 + frac * 48.0))),
-        Span::styled("━".repeat(width - filled), Style::new().fg(FAINT)),
+        Span::styled("━".repeat(width - filled), Style::new().fg(t().faint)),
     ]
 }
-
-/// Gradient end points for the big bars. Both warm, but util leans pink and memory leans gold,
-/// so they're easy to tell apart.
-pub const UTIL_FROM: (u8, u8, u8) = (255, 125, 70); // orange
-pub const UTIL_TO: (u8, u8, u8) = (255, 60, 160); // hot pink
-pub const MEM_FROM: (u8, u8, u8) = (255, 215, 100); // gold
-pub const MEM_TO: (u8, u8, u8) = (255, 145, 95); // peach
 
 pub fn rgb(c: (u8, u8, u8)) -> Color {
     Color::Rgb(c.0, c.1, c.2)
@@ -93,11 +73,11 @@ pub fn big_bar(frac: f64, width: usize, from: (u8, u8, u8), to: (u8, u8, u8)) ->
     let mut used = full;
     if full < width && part > 0 {
         let glyph = if part >= 8 { "█" } else { PARTS[part] };
-        spans.push(Span::styled(glyph, Style::new().fg(at(full)).bg(TRACK)));
+        spans.push(Span::styled(glyph, Style::new().fg(at(full)).bg(t().track)));
         used += 1;
     }
     if used < width {
-        spans.push(Span::styled("█".repeat(width - used), Style::new().fg(TRACK)));
+        spans.push(Span::styled("█".repeat(width - used), Style::new().fg(t().track)));
     }
     spans
 }
@@ -105,19 +85,19 @@ pub fn big_bar(frac: f64, width: usize, from: (u8, u8, u8), to: (u8, u8, u8)) ->
 /// (symbol, short label, color) for a Slurm state
 pub fn state_look(state: &str) -> (&'static str, &'static str, Color) {
     match state {
-        "RUNNING" => ("●", "run", GREEN),
-        "PENDING" => ("◌", "wait", YELLOW),
-        "CONFIGURING" => ("◍", "boot", ACCENT),
-        "COMPLETING" => ("◍", "end", DIM),
-        "COMPLETED" => ("✓", "done", SOFT_GREEN),
-        "FAILED" => ("✗", "fail", RED),
-        "OUT_OF_MEMORY" => ("✗", "oom", RED),
-        "NODE_FAIL" | "BOOT_FAIL" => ("✗", "node", RED),
-        "TIMEOUT" | "DEADLINE" => ("⏱", "time", ORANGE),
-        "PREEMPTED" => ("⊘", "prmt", ORANGE),
-        "CANCELLED" => ("⊘", "cncl", DIM),
-        "SUSPENDED" => ("‖", "susp", DIM),
-        _ => ("·", "?", DIM),
+        "RUNNING" => ("●", "run", t().running),
+        "PENDING" => ("◌", "wait", t().queued),
+        "CONFIGURING" => ("◍", "boot", t().accent),
+        "COMPLETING" => ("◍", "end", t().dim),
+        "COMPLETED" => ("✓", "done", t().done),
+        "FAILED" => ("✗", "fail", t().failed),
+        "OUT_OF_MEMORY" => ("✗", "oom", t().failed),
+        "NODE_FAIL" | "BOOT_FAIL" => ("✗", "node", t().failed),
+        "TIMEOUT" | "DEADLINE" => ("⏱", "time", t().warning),
+        "PREEMPTED" => ("⊘", "prmt", t().warning),
+        "CANCELLED" => ("⊘", "cncl", t().dim),
+        "SUSPENDED" => ("‖", "susp", t().dim),
+        _ => ("·", "?", t().dim),
     }
 }
 

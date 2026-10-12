@@ -1,0 +1,28 @@
+# gpudash theme for light terminals. Colors are "#rrggbb".
+
+background = "#fafafa"
+text = "#24292f"
+dim = "#6e7781"
+faint = "#d0d7de"
+accent = "#0969da"
+selection = "#eaeef2"
+track = "#e6e8eb"
+
+running = "#1a7f37"
+queued = "#9a6700"
+done = "#2da44e"
+failed = "#cf222e"
+warning = "#bc4c00"
+
+temperature = ["#0969da", "#1a7f37", "#bf8700", "#bc4c00", "#cf222e"]
+util = ["#e16f24", "#bf3989"]
+memory = ["#d4a72c", "#e16f24"]
+
+[log]
+number = "#8250df"
+string = "#116329"
+path = "#0550ae"
+key = "#57606a"
+error = "#cf222e"
+warning = "#9a6700"
+bar = "#1a7f37"

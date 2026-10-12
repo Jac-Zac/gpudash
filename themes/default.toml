@@ -1,0 +1,28 @@
+# gpudash theme. Colors are "#rrggbb". Leave a key out to use the default.
+
+background = ""          # "" = keep your terminal's own background
+text = "#d7dce6"
+dim = "#6e7382"          # labels, secondary text
+faint = "#3c404c"        # borders
+accent = "#78aaff"       # keys, highlights, selection marker
+selection = "#262a36"    # selected row
+track = "#2c303c"        # empty part of the big bars
+
+running = "#50dc8c"
+queued = "#f0c850"
+done = "#5aa57d"
+failed = "#ff5050"
+warning = "#ff963c"      # time limit, preempted
+
+temperature = ["#5aa0ff", "#50dc8c", "#f0dc50", "#ff8c32", "#ff323c"]  # 30° → 88°, cool to hot
+util = ["#ff7d46", "#ff3ca0"]      # usage bar, empty → full
+memory = ["#ffd764", "#ff915f"]    # memory bar, empty → full
+
+[log]
+number = "#d7a0ff"
+string = "#96d78c"
+path = "#6ec8d7"
+key = "#8ca0c8"
+error = "#ff9696"
+warning = "#f0d796"
+bar = "#50dc8c"          # progress bars

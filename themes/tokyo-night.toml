@@ -1,0 +1,28 @@
+# Tokyo Night (https://github.com/folke/tokyonight.nvim). Colors are "#rrggbb".
+
+background = "#1a1b26"
+text = "#c0caf5"
+dim = "#565f89"
+faint = "#3b4261"
+accent = "#7aa2f7"
+selection = "#283457"
+track = "#292e42"
+
+running = "#9ece6a"
+queued = "#e0af68"
+done = "#73daca"
+failed = "#f7768e"
+warning = "#ff9e64"
+
+temperature = ["#7aa2f7", "#9ece6a", "#e0af68", "#ff9e64", "#f7768e"]
+util = ["#ff9e64", "#bb9af7"]
+memory = ["#e0af68", "#ff9e64"]
+
+[log]
+number = "#bb9af7"
+string = "#9ece6a"
+path = "#7dcfff"
+key = "#7aa2f7"
+error = "#f7768e"
+warning = "#e0af68"
+bar = "#9ece6a"

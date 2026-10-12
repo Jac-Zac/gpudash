@@ -6,6 +6,7 @@ mod highlight;
 mod notifier;
 mod palette;
 mod remote;
+mod theme;
 mod ui;
 mod util;
 
@@ -26,7 +27,7 @@ usage: gpudash [-n SECONDS] [HOST ...]
   -n SECONDS  how often to refresh (overrides the config for this run)
 
 config: ~/.config/gpudash/config.toml
-  Press k inside gpudash to change settings and add or remove clusters.
+  Press p inside gpudash to change settings and add or remove clusters.
   A minimal config:
 
     [[cluster]]
@@ -62,7 +63,12 @@ fn main() -> std::io::Result<()> {
         std::process::exit(1);
     }
 
+    theme::write_examples();
+    let theme_error = theme::apply(&config.theme).err();
     let mut app = App::new(config, hosts);
+    if let Some(e) = theme_error {
+        app.say(e, true);
+    }
     let mut terminal = ratatui::init();
     app.refresh();
     let result = run(&mut terminal, &mut app);
@@ -175,7 +181,7 @@ fn on_key(app: &mut App, k: KeyEvent) -> Next {
         let top = v.top.unwrap_or(bottom);
         let mut scroll = |to: usize| v.top = if to >= bottom { None } else { Some(to) };
         match k.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left => app.log = None,
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') | KeyCode::Left => app.log = None,
             KeyCode::Up | KeyCode::Char('k') => scroll(top.saturating_sub(1)),
             KeyCode::Down | KeyCode::Char('j') => scroll(top + 1),
             KeyCode::PageUp | KeyCode::Char('u') => scroll(top.saturating_sub(page)),
@@ -190,7 +196,7 @@ fn on_key(app: &mut App, k: KeyEvent) -> Next {
     }
 
     match k.code {
-        KeyCode::Char('k') | KeyCode::Char(':') => app.palette = Some(Palette::new()),
+        KeyCode::Char('p') | KeyCode::Char(':') => app.palette = Some(Palette::new()),
         KeyCode::Char('q') => return Next::Quit,
         KeyCode::Esc if !app.filter.is_empty() => {
             app.filter.clear();
@@ -199,7 +205,7 @@ fn on_key(app: &mut App, k: KeyEvent) -> Next {
         KeyCode::Esc => return Next::Quit,
         KeyCode::Char('r') => app.refresh(),
         KeyCode::Down | KeyCode::Char('j') => app.step(1),
-        KeyCode::Up => app.step(-1),
+        KeyCode::Up | KeyCode::Char('k') => app.step(-1),
         KeyCode::PageDown => app.step(10),
         KeyCode::PageUp => app.step(-10),
         KeyCode::Home | KeyCode::Char('g') => app.jump(false),
@@ -209,7 +215,7 @@ fn on_key(app: &mut App, k: KeyEvent) -> Next {
         KeyCode::Char('y') => app.copy_id(),
         KeyCode::Char('/') => app.filtering = true,
         KeyCode::Char('?') => app.popup = Some(Popup::Help),
-        KeyCode::Char('h') => app.cycle_ended(),
+        KeyCode::Char('e') => app.cycle_ended(),
         KeyCode::Char('n') => return app.run(palette::Cmd::ToggleNotify),
         KeyCode::Char('s') => return app.shell_target(),
         _ => {}

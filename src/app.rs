@@ -199,7 +199,10 @@ impl App {
         }
         self.config = config;
         self.apply_display();
-        self.say("config reloaded", false);
+        match crate::theme::apply(&self.config.theme) {
+            Ok(()) => self.say("config reloaded", false),
+            Err(e) => self.say(e, true),
+        }
         self.refresh();
     }
 
@@ -549,6 +552,24 @@ impl App {
                 c.temperature_graph = !c.temperature_graph;
                 let on = c.temperature_graph;
                 self.save(if on { "temperature graph on" } else { "temperature graph off" });
+            }
+            Cmd::Theme(name) => match crate::theme::apply(&name) {
+                Ok(()) => {
+                    c.theme = name.clone();
+                    self.save(format!("theme: {name}"));
+                }
+                Err(e) => self.say(e, true),
+            },
+            Cmd::OpenThemes => {
+                crate::theme::write_examples();
+                match crate::theme::folder() {
+                    Some(dir) => {
+                        let _ = std::fs::create_dir_all(&dir);
+                        let _ = std::process::Command::new("open").arg(&dir).status();
+                        self.say("opened the themes folder", false);
+                    }
+                    None => self.say("no config folder", true),
+                }
             }
             Cmd::AddCluster => {
                 self.palette = Some(Palette::with_prompt(Prompt {

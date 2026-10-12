@@ -42,7 +42,15 @@ It finds logs even after Slurm has forgotten the job.
 
 ![the command palette](assets/screenshots/palette.png)
 
-`k` opens every action and setting in one searchable list. Changes are saved for next time.
+`p` opens every action and setting in one searchable list. Changes are saved for next time.
+
+### Themes
+
+![four of the built-in themes](assets/screenshots/themes.png)
+
+Six built-in themes (`default`, `light`, `nord`, `gruvbox`, `catppuccin-mocha`,
+`tokyo-night`), switchable live from the palette (`p` → *Theme*). Make your own by adding a
+`.toml` file to `~/.config/gpudash/themes/`; see [Themes](#making-a-theme) below.
 
 ### And
 
@@ -69,7 +77,7 @@ macOS asks.
 **1. ssh.** Each cluster needs a `Host` entry in `~/.ssh/config` that logs in without a
 password. Check with `ssh -o BatchMode=yes mycluster true`.
 
-**2. Clusters.** Start with one, then add the rest from inside the app (`k` → *Add cluster*):
+**2. Clusters.** Start with one, then add the rest from inside the app (`p` → *Add cluster*):
 
 ```sh
 gpudash explorer
@@ -81,14 +89,14 @@ gpudash saves them, so next time plain `gpudash` shows them all.
 
 | key           | action                                          |
 | ------------- | ----------------------------------------------- |
-| `k`           | command palette                                 |
-| `↑` `↓` / `j` | move                                            |
-| `enter`       | open the job's log (`e` stdout/stderr, `esc` back) |
+| `p`           | command palette                                 |
+| `j` `k` / `↑` `↓` | move                                        |
+| `enter` / `l` | open the job's log (`e` stdout/stderr, `h` / `esc` back) |
 | `s`           | shell into the job                              |
 | `x`           | cancel the job                                  |
 | `y`           | copy the job id                                 |
 | `/`           | filter                                          |
-| `h`           | ended jobs: recent → all from 24h → hidden      |
+| `e`           | ended jobs: recent → all from 24h → hidden      |
 | `n`           | notifications on / off                          |
 | `r`           | refresh now                                     |
 | `?`           | all keys                                        |
@@ -100,6 +108,7 @@ Settings live in `~/.config/gpudash/config.toml`. The command palette changes th
 these are the defaults:
 
 ```toml
+theme = "default"           # any file in ~/.config/gpudash/themes/
 refresh_seconds = 30
 ended_jobs = "recent"       # "recent", "all" or "hidden"
 recent_ended = 5
@@ -115,6 +124,31 @@ temperature_graph = true
 host = "explorer"           # ssh Host name
 prefix = "/projects/me/"    # optional: hidden from the folder column
 ```
+
+### Making a theme
+
+On first run gpudash copies its built-in themes to `~/.config/gpudash/themes/`. Copy one,
+change the colors, and pick it with `p` → *Theme* (picking it again reloads your edits).
+Any key you leave out keeps the default color:
+
+```toml
+# ~/.config/gpudash/themes/mine.toml
+background = ""                 # "" keeps your terminal's background
+text = "#d7dce6"
+accent = "#78aaff"
+running = "#50dc8c"
+queued = "#f0c850"
+failed = "#ff5050"
+temperature = ["#5aa0ff", "#50dc8c", "#f0dc50", "#ff8c32", "#ff323c"]  # cool → hot
+util = ["#ff7d46", "#ff3ca0"]   # usage bar
+memory = ["#ffd764", "#ff915f"] # memory bar
+
+[log]
+number = "#d7a0ff"
+error = "#ff9696"
+```
+
+The full list of keys is in [`themes/default.toml`](themes/default.toml).
 
 `gpudash mycluster` watches just that cluster; `gpudash -n 60` refreshes every 60 s this time.
 

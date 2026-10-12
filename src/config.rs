@@ -39,6 +39,7 @@ pub struct ClusterConf {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
 pub struct Config {
+    pub theme: String,
     pub refresh_seconds: u64,
     pub ended_jobs: Ended,
     pub recent_ended: usize,
@@ -56,6 +57,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
+            theme: "default".into(),
             refresh_seconds: 30,
             ended_jobs: Ended::Recent,
             recent_ended: 5,
@@ -72,8 +74,9 @@ impl Default for Config {
 }
 
 const HEADER: &str = "\
-# gpudash settings. Edit by hand, or press k in gpudash to change them from the command palette.
+# gpudash settings. Edit by hand, or press p in gpudash to change them from the command palette.
 #
+# theme              a theme from the themes/ folder next to this file (\"default\", \"light\", \"nord\"…)
 # refresh_seconds    how often to poll the clusters
 # ended_jobs         \"recent\", \"all\" or \"hidden\": jobs that ended in the last 24h
 # recent_ended       how many ended jobs per cluster \"recent\" shows

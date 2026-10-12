@@ -1,0 +1,28 @@
+# Nord (https://www.nordtheme.com). Colors are "#rrggbb".
+
+background = "#2e3440"
+text = "#eceff4"
+dim = "#7b88a1"
+faint = "#434c5e"
+accent = "#88c0d0"
+selection = "#3b4252"
+track = "#3b4252"
+
+running = "#a3be8c"
+queued = "#ebcb8b"
+done = "#8fbcbb"
+failed = "#bf616a"
+warning = "#d08770"
+
+temperature = ["#5e81ac", "#a3be8c", "#ebcb8b", "#d08770", "#bf616a"]
+util = ["#d08770", "#b48ead"]
+memory = ["#ebcb8b", "#d08770"]
+
+[log]
+number = "#b48ead"
+string = "#a3be8c"
+path = "#88c0d0"
+key = "#81a1c1"
+error = "#bf616a"
+warning = "#ebcb8b"
+bar = "#a3be8c"
