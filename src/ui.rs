@@ -101,8 +101,9 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     } else if app.paused {
         right.push(Span::styled("‖ paused ", Style::new().fg(YELLOW)));
     } else {
-        let left_s = app.interval().saturating_sub(app.last_refresh.elapsed()).as_secs();
-        right.push(dim(format!("↻ {left_s}s ")));
+        let left = app.interval().saturating_sub(app.last_refresh.elapsed()).as_secs();
+        let left = if left >= 60 { format!("{}m{:02}s", left / 60, left % 60) } else { format!("{left}s") };
+        right.push(dim(format!("↻ {left} ")));
     }
     f.render_widget(Paragraph::new(left), area);
     f.render_widget(Paragraph::new(Line::from(right).right_aligned()), area);
@@ -287,10 +288,12 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
             let [left, right] = Layout::horizontal([Constraint::Fill(1), Constraint::Length(42)]).areas(area);
             area = left;
             let now = *h.last().unwrap();
+            // GPUs rarely sit below 20°, so start the scale there to make changes visible
+            let shifted: Vec<u64> = h.iter().map(|t| t.saturating_sub(20)).collect();
             let spark = Sparkline::default()
                 .block(panel().title(dim(format!(" max temp · last {} polls ", h.len()))))
-                .data(h.as_slice())
-                .max(95)
+                .data(&shifted)
+                .max(75)
                 .style(Style::new().fg(temp_color(now as f64)));
             f.render_widget(spark, right);
         }
