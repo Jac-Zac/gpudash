@@ -6,32 +6,11 @@ You run `gpudash` on your laptop. It logs into each cluster over ssh, asks Slurm
 have running and queued, and reads the temperature of every GPU your jobs are on. Everything
 shows up in one full-screen view that refreshes itself.
 
-```
- gpudash   2 running · 5 queued · 5 GPUs in use                                          ↻ 21s
-╭ explorer 1 running · 4 queued · 12 ended (24h, showing 5) ─────────────────────── 9s ago ╮
-│ id         name              state   gpu      time              temp / start      folder │
-│▌11003446   train-baseline    ● run   1× A100  ━━━━━ 3h14/6h     58°               lens   │
-│ 11005358   sweep-lr          ◌ wait  1× H200        1h          in 20m · 04:57pm  sweeps │
-│ 11005414   eval-big          ◌ wait  1× H200        2h          in 2h09 · 06:47pm evals  │
-│ 11005418   eval-big          ◌ wait  1× H200        8h          ?                 evals  │
-│ 11003221   sweep-lr          ✓ done  1× GPU         2h56/8h     ended 3h38 ago    sweeps │
-│ 11003445   probe-train       ✗ fail  1× GPU         3h51/6h     ended 2h17 ago · exit 1  │
-╰──────────────────────────────────────────────────────────────────────────────────────────╯
-╭ KISSKI 1 running · 1 queued ────────────────────────────────────────────────── 10s ago ╮
-│ 16626415   pretrain-1b       ● run   4× H100  ━━━━━ 6h02/1d     61° 64° 59° 62°   code   │
-│ 16626416   pretrain-1b-v2    ◌ wait  4× H100        1d          ? Dependency      code   │
-╰──────────────────────────────────────────────────────────────────────────────────────────╯
-╭ ● train-baseline 11003446 · explorer ────────────────────────────────────────────────────╮
-│ folder  /projects/me/lens                                    ╭ max temp · last 40 polls ╮│
-│ node    d1029 · gpu                                          │      ▂▃▅▆▆▇▇▆▇▇▇▆▇▇▇▇▇▆▇ ││
-│ gpus    A100    58°  util ━━━━━━━━━━  99%  mem ━━━━━━━──── 52/80 GB                     ││
-╰──────────────────────────────────────────────────────────────────────────────────────────╯
- ↑↓ move  enter log  s shell  x cancel  / filter  ? help  q quit
-```
+![gpudash showing queued and recently ended jobs on two clusters](assets/screenshot.webp)
 
-In a real terminal it's in color. Temperatures go from blue (cool) through green and yellow
-to red (hot). The time bar fills up and turns from green to red as a job gets close to its
-time limit.
+Running jobs also show each GPU's temperature, colored from blue (cool) through green and
+yellow to red (hot), and a time bar that fills up and turns from green to red as the job
+gets close to its time limit.
 
 ## What it shows
 
