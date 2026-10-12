@@ -1,0 +1,18 @@
+[package]
+name = "gpudash"
+version = "0.1.0"
+edition = "2024"
+description = "Live terminal dashboard for your Slurm jobs across several clusters"
+license = "MIT"
+repository = "https://github.com/RollingRo11/gpudash"
+readme = "README.md"
+keywords = ["slurm", "hpc", "gpu", "tui", "ratatui"]
+categories = ["command-line-utilities"]
+
+[profile.release]
+lto = true
+strip = true
+
+[dependencies]
+chrono = "0.4"
+ratatui = "0.29"
