@@ -2,11 +2,14 @@
 
 use ratatui::prelude::*;
 use ratatui::widgets::{
-    Block, BorderType, Cell, Clear, HighlightSpacing, Padding, Paragraph, Row, Sparkline, Table, TableState,
+    Block, BorderType, Cell, Clear, HighlightSpacing, List, ListItem, ListState, Padding, Paragraph, Row, Sparkline,
+    Table, TableState,
 };
 
+use crate::app::{App, Cluster, LogView, Popup};
+use crate::config::Ended;
 use crate::highlight;
-use crate::app::{App, Cluster, Ended, LogView, Popup, RECENT_ENDED};
+use crate::palette::{self, Act, Palette};
 use crate::remote::Job;
 use crate::util::*;
 
@@ -34,10 +37,26 @@ fn panel() -> Block<'static> {
     Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(FAINT))
 }
 
+/// Running jobs get two rows per GPU (util and memory bars), up to 4 GPUs.
+fn detail_height(app: &App) -> u16 {
+    match app.selected_job() {
+        Some((_, _, j)) if j.running() => {
+            let gpus = j.gpus.len().clamp(1, 4) as u16;
+            let more = u16::from(j.gpus.len() > 4);
+            (2 + 2 * gpus + more + 2).max(8)
+        }
+        _ => 8,
+    }
+}
+
 pub fn draw(f: &mut Frame, app: &App) {
-    let [head, body, detail, foot] =
-        Layout::vertical([Constraint::Length(1), Constraint::Fill(1), Constraint::Length(8), Constraint::Length(1)])
-            .areas(f.area());
+    let [head, body, detail, foot] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Fill(1),
+        Constraint::Length(detail_height(app)),
+        Constraint::Length(1),
+    ])
+    .areas(f.area());
 
     draw_header(f, head, app);
     draw_clusters(f, body, app);
@@ -51,6 +70,9 @@ pub fn draw(f: &mut Frame, app: &App) {
         Some(Popup::Help) => draw_help(f),
         Some(Popup::ConfirmCancel { ci, id, name }) => draw_confirm(f, &app.clusters[*ci].host, id, name),
         None => {}
+    }
+    if let Some(p) = &app.palette {
+        draw_palette(f, app, p);
     }
 }
 
@@ -71,13 +93,15 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         dim(format!(" · {gpus} GPUs in use")),
     ]);
     let mut right = vec![];
-    if !app.notify {
+    if !app.config.notifications {
         right.push(dim("notifications off · "));
     }
     if app.loading() {
         right.extend([spinner(app.tick), dim(" refreshing ")]);
+    } else if app.paused {
+        right.push(Span::styled("‖ paused ", Style::new().fg(YELLOW)));
     } else {
-        let left_s = app.interval.saturating_sub(app.last_refresh.elapsed()).as_secs();
+        let left_s = app.interval().saturating_sub(app.last_refresh.elapsed()).as_secs();
         right.push(dim(format!("↻ {left_s}s ")));
     }
     f.render_widget(Paragraph::new(left), area);
@@ -109,8 +133,9 @@ fn draw_cluster(f: &mut Frame, area: Rect, app: &App, ci: usize, c: &Cluster, jo
         let d = all.iter().filter(|j| j.finished()).count();
         let mut counts = format!("{r} running · {q} queued");
         if d > 0 {
-            counts += &match app.ended {
-                Ended::Recent if d > RECENT_ENDED => format!(" · {d} ended (24h, showing {RECENT_ENDED})"),
+            let recent = app.config.recent_ended;
+            counts += &match app.config.ended_jobs {
+                Ended::Recent if d > recent => format!(" · {d} ended (24h, showing {recent})"),
                 Ended::Hidden => format!(" · {d} ended (hidden)"),
                 _ => format!(" · {d} ended (24h)"),
             };
@@ -200,7 +225,7 @@ fn job_row(j: &Job, prefix: &str, since: u64) -> Row<'static> {
         let shown = if many { vec![*temps.iter().max().unwrap()] } else { temps };
         let mut spans: Vec<Span> = shown
             .iter()
-            .map(|&t| Span::styled(format!("{t}° "), Style::new().fg(temp_color(t as f64)).bold()))
+            .map(|&t| Span::styled(format!("{} ", temp_text(t)), Style::new().fg(temp_color(t as f64)).bold()))
             .collect();
         if many {
             spans.push(dim("max"));
@@ -252,39 +277,48 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
 
     if j.running() {
         lines.push(Line::from(vec![label("node"), text(format!("{} · {}", j.nodes, j.partition))]));
+
+        // temperature history on the right
+        if let Some(h) = history.filter(|_| app.config.temperature_graph && area.width > 110) {
+            let [left, right] = Layout::horizontal([Constraint::Fill(1), Constraint::Length(42)]).areas(area);
+            area = left;
+            let now = *h.last().unwrap();
+            let spark = Sparkline::default()
+                .block(panel().title(dim(format!(" max temp · last {} polls ", h.len()))))
+                .data(h.as_slice())
+                .max(95)
+                .style(Style::new().fg(temp_color(now as f64)));
+            f.render_widget(spark, right);
+        }
+
+        // two big bars per GPU: util on the first row, memory on the second
+        let inner = area.width.saturating_sub(4) as usize; // borders + padding
+        const LEFT: usize = 8 + 7 + 7 + 6; // label, name, temp, "util "
+        const RIGHT: usize = 13; // value after the bar
+        let width = inner.saturating_sub(LEFT + RIGHT).max(10);
+        let many = j.gpus.len() > 1;
         for (i, g) in j.gpus.iter().take(4).enumerate() {
-            let mut spans = vec![
-                label(if i == 0 { "gpus" } else { "" }),
-                text(format!("{:<6}", g.name)),
-                Span::styled(format!("{:>3}° ", g.temp), Style::new().fg(temp_color(g.temp as f64)).bold()),
-                dim(" util "),
+            let tag = if many { format!("gpu {i}") } else { "gpu".to_string() };
+            let mut util = vec![
+                dim(format!("{tag:<8}")),
+                Span::styled(format!("{:<7}", g.name), Style::new().fg(TEXT).bold()),
+                Span::styled(format!("{:<7}", temp_text(g.temp)), Style::new().fg(temp_color(g.temp as f64)).bold()),
+                dim("util  "),
             ];
-            spans.extend(bar(g.util as f64 / 100.0, 10));
-            spans.push(text(format!(" {:>3}%", g.util)));
-            spans.push(dim("  mem "));
-            spans.extend(bar(g.mem_used as f64 / g.mem_total.max(1) as f64, 10));
-            spans.push(text(format!(" {:.0}/{:.0} GB", g.mem_used as f64 / 1024.0, g.mem_total as f64 / 1024.0)));
-            lines.push(Line::from(spans));
+            util.extend(big_bar(g.util as f64 / 100.0, width));
+            util.push(Span::styled(format!(" {:>4}%", g.util), Style::new().fg(TEXT).bold()));
+            lines.push(Line::from(util));
+
+            let mut mem = vec![dim(format!("{:<22}", "")), dim("mem   ")];
+            mem.extend(big_bar(g.mem_used as f64 / g.mem_total.max(1) as f64, width));
+            mem.push(text(format!(" {:>3.0}/{:.0} GB", g.mem_used as f64 / 1024.0, g.mem_total as f64 / 1024.0)));
+            lines.push(Line::from(mem));
         }
         if j.gpus.len() > 4 {
-            lines.push(Line::from(vec![label(""), dim(format!("+{} more", j.gpus.len() - 4))]));
+            lines.push(Line::from(vec![label(""), dim(format!("+{} more GPUs", j.gpus.len() - 4))]));
         }
         if j.gpus.is_empty() {
-            lines.push(Line::from(vec![label("gpus"), dim("no reading")]));
-        }
-        // temperature history on the right
-        if let Some(h) = history {
-            if area.width > 100 {
-                let [left, right] = Layout::horizontal([Constraint::Fill(1), Constraint::Length(42)]).areas(area);
-                area = left;
-                let now = *h.last().unwrap();
-                let spark = Sparkline::default()
-                    .block(panel().title(dim(format!(" max temp · last {} polls ", h.len()))))
-                    .data(h.as_slice())
-                    .max(95)
-                    .style(Style::new().fg(temp_color(now as f64)));
-                f.render_widget(spark, right);
-            }
+            lines.push(Line::from(vec![label("gpu"), dim("no reading yet")]));
         }
     } else if let Some(end) = j.end {
         lines.push(Line::from(vec![
@@ -323,6 +357,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     } else {
         let hints = Line::from(vec![
             key(" ↑↓"), dim(" move  "),
+            key("k"), dim(" commands  "),
             key("enter"), dim(" log  "),
             key("s"), dim(" shell  "),
             key("x"), dim(" cancel  "),
@@ -407,14 +442,15 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
 
 fn draw_help(f: &mut Frame) {
     let rows = [
-        ("↑ ↓  j k", "move"),
+        ("↑ ↓  j", "move"),
+        ("k  :", "command palette: every action and setting"),
         ("g G", "first / last job"),
         ("enter  l", "open the job's log"),
         ("s", "shell into the job (its GPU node if running)"),
         ("x", "cancel the job"),
         ("y", "copy the job id"),
         ("/", "filter by name, folder or id"),
-        ("h", "ended jobs: recent 5 → all from 24h → hidden"),
+        ("h", "ended jobs: recent → all from 24h → hidden"),
         ("n", "turn Mac notifications on / off"),
         ("r", "refresh now"),
         ("q  esc", "quit"),
@@ -423,7 +459,7 @@ fn draw_help(f: &mut Frame) {
         .iter()
         .map(|(k, d)| Line::from(vec![Span::styled(format!("{k:<12}"), Style::new().fg(ACCENT)), text(*d)]))
         .collect();
-    let area = centered(f.area(), 62, lines.len() as u16 + 4);
+    let area = centered(f.area(), 66, lines.len() as u16 + 4);
     f.render_widget(Clear, area);
     let block = panel()
         .title(Span::styled(" keys ", Style::new().fg(TEXT).bold()))
@@ -444,4 +480,87 @@ fn draw_confirm(f: &mut Frame, host: &str, id: &str, name: &str) {
         .border_style(Style::new().fg(RED))
         .padding(Padding::horizontal(1));
     f.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_palette(f: &mut Frame, app: &App, p: &Palette) {
+    if let Some(prompt) = &p.prompt {
+        let area = centered(f.area(), 64, 7);
+        f.render_widget(Clear, area);
+        let block = panel()
+            .border_style(Style::new().fg(ACCENT))
+            .title(Span::styled(format!(" {} ", prompt.title), Style::new().fg(TEXT).bold()))
+            .title_bottom(Line::from(vec![key(" enter"), dim(" save  "), key("esc"), dim(" cancel ")]))
+            .padding(Padding::horizontal(1));
+        let lines = vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("› ", Style::new().fg(ACCENT)),
+                text(prompt.text.clone()),
+                Span::styled("█", Style::new().fg(ACCENT)),
+            ]),
+            Line::from(""),
+            Line::from(dim(prompt.help.clone())),
+        ];
+        f.render_widget(Paragraph::new(lines).block(block), area);
+        return;
+    }
+
+    let Some(level) = p.stack.last() else { return };
+    let area = centered(f.area(), 72, 22);
+    f.render_widget(Clear, area);
+    let crumbs: Vec<&str> = p.stack.iter().map(|l| l.menu.title()).collect();
+    let block = panel()
+        .border_style(Style::new().fg(ACCENT))
+        .title(Span::styled(format!(" {} ", crumbs.join(" › ")), Style::new().fg(TEXT).bold()))
+        .title_bottom(Line::from(vec![
+            key(" ↑↓"), dim(" choose  "),
+            key("enter"), dim(" run  "),
+            key("esc"), dim(if p.stack.len() > 1 { " back " } else { " close " }),
+        ]));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let [input, gap, list_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
+
+    let mut input_line = vec![Span::styled(" › ", Style::new().fg(ACCENT)), text(level.query.clone())];
+    input_line.push(Span::styled("█", Style::new().fg(ACCENT)));
+    if level.query.is_empty() {
+        input_line.push(dim(" type to search"));
+    }
+    f.render_widget(Paragraph::new(Line::from(input_line)), input);
+    f.render_widget(Paragraph::new(Span::styled("─".repeat(gap.width as usize), Style::new().fg(FAINT))), gap);
+
+    let items: Vec<palette::Item> =
+        palette::search(app, level.menu, &level.query);
+    if items.is_empty() {
+        f.render_widget(Paragraph::new(dim("  nothing matches")), list_area);
+        return;
+    }
+    // room for the highlight symbol
+    let width = (list_area.width as usize).saturating_sub(1);
+    let rows: Vec<ListItem> = items
+        .iter()
+        .map(|it| {
+            let group = if it.group.is_empty() { String::new() } else { format!("{:<9}", it.group) };
+            let arrow = if matches!(it.act, Act::Open(_)) { " ›" } else { "" };
+            let used = 1 + group.chars().count() + it.label.chars().count() + arrow.chars().count();
+            let hint = format!("{} ", it.hint);
+            let pad = width.saturating_sub(used + hint.chars().count());
+            let hint_color = if it.hint == "on" || it.hint == "✓" { GREEN } else { DIM };
+            ListItem::new(Line::from(vec![
+                dim(format!(" {group}")),
+                text(it.label.clone()),
+                dim(arrow),
+                Span::raw(" ".repeat(pad)),
+                Span::styled(hint, Style::new().fg(hint_color)),
+            ]))
+        })
+        .collect();
+    let mut state = ListState::default();
+    state.select(Some(level.sel.min(items.len() - 1)));
+    let list = List::new(rows)
+        .highlight_style(Style::new().bg(SEL_BG))
+        .highlight_symbol("▌")
+        .highlight_spacing(HighlightSpacing::Always);
+    f.render_stateful_widget(list, list_area, &mut state);
 }

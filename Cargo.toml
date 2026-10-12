@@ -17,3 +17,5 @@ strip = true
 chrono = "0.4"
 ratatui = "0.29"
 regex = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"

@@ -299,6 +299,16 @@ pub fn cancel(host: &str, id: &str) -> Result<(), String> {
 }
 
 /// Interactive shell: inside the job's allocation if it's running, else in its folder on the login node.
+/// Close the shared ssh connection, so the next poll logs in fresh.
+pub fn disconnect(host: &str) {
+    let _ = Command::new("ssh")
+        .args(["-o", CONTROL_PATH, "-O", "exit", host])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 pub fn shell(host: &str, workdir: &str, running_id: Option<&str>) -> std::io::Result<()> {
     let cd = format!("cd {} 2>/dev/null", sh_quote(workdir));
     let remote = match running_id {
@@ -309,17 +319,6 @@ pub fn shell(host: &str, workdir: &str, running_id: Option<&str>) -> std::io::Re
         .args(["-t", "-o", "ControlMaster=no", "-o", CONTROL_PATH, host, &remote])
         .status()
         .map(|_| ())
-}
-
-pub fn notify(title: &str, body: &str) {
-    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
-    let script = format!("display notification \"{}\" with title \"{}\"", esc(body), esc(title));
-    let _ = Command::new("osascript")
-        .args(["-e", &script])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
 }
 
 pub fn copy_to_clipboard(text: &str) -> bool {

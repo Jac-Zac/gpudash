@@ -1,69 +1,42 @@
 //! gpudash — live terminal dashboard for your Slurm jobs across clusters.
 
 mod app;
+mod config;
 mod highlight;
+mod notifier;
+mod palette;
 mod remote;
 mod ui;
 mod util;
 
-use std::path::PathBuf;
 use std::time::Duration;
 
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use app::{App, Ended, Popup};
-
-const DEFAULT_INTERVAL: u64 = 30;
+use app::{App, Next, Popup};
+use palette::{Act, Palette};
 
 const HELP: &str = "\
 gpudash — live dashboard for your Slurm jobs across clusters
 
 usage: gpudash [-n SECONDS] [HOST ...]
 
-  HOST        ssh host aliases to watch (default: the ones in the config file)
-  -n SECONDS  how often to refresh (default 30)
+  HOST        ssh host names to watch (default: the clusters in the config file)
+  -n SECONDS  how often to refresh (overrides the config for this run)
 
-config: ~/.config/gpudash/clusters, one cluster per line:
+config: ~/.config/gpudash/config.toml
+  Press k inside gpudash to change settings and add or remove clusters.
+  A minimal config:
 
-  # ssh alias   folder prefix to hide in the table (optional)
-  explorer      /projects/myname/
-  KISSKI        /mnt/vast-kisski/projects/myproject/
+    [[cluster]]
+    host = \"explorer\"                  # ssh host name from ~/.ssh/config
+    prefix = \"/projects/myname/\"       # optional: hidden in the folder column
 ";
-
-fn config_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("gpudash/clusters"))
-}
-
-fn load_config() -> Vec<(String, String)> {
-    let Some(text) = config_path().and_then(|p| std::fs::read_to_string(p).ok()) else {
-        return Vec::new();
-    };
-    text.lines()
-        .map(|l| l.split('#').next().unwrap_or("").trim())
-        .filter(|l| !l.is_empty())
-        .map(|l| {
-            let mut parts = l.split_whitespace();
-            let host = parts.next().unwrap_or_default().to_string();
-            let prefix = parts.next().unwrap_or_default().to_string();
-            (host, prefix)
-        })
-        .collect()
-}
-
-/// What the event loop should do after a key press.
-enum Next {
-    Continue,
-    Quit,
-    Shell { host: String, workdir: String, running_id: Option<String> },
-}
 
 fn main() -> std::io::Result<()> {
     let mut args = std::env::args().skip(1);
-    let mut interval = DEFAULT_INTERVAL;
+    let mut interval = None;
     let mut hosts = Vec::new();
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -71,29 +44,25 @@ fn main() -> std::io::Result<()> {
                 print!("{HELP}");
                 return Ok(());
             }
-            "-n" => interval = args.next().and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_INTERVAL),
+            "-n" => interval = args.next().and_then(|s| s.parse().ok()),
             _ => hosts.push(a),
         }
     }
 
-    let config = load_config();
-    let clusters: Vec<(String, String)> = if hosts.is_empty() {
-        config
-    } else {
-        hosts
-            .into_iter()
-            .map(|h| {
-                let prefix = config.iter().find(|(c, _)| *c == h).map(|(_, p)| p.clone()).unwrap_or_default();
-                (h, prefix)
-            })
-            .collect()
-    };
-    if clusters.is_empty() {
-        eprint!("No clusters to watch. Pass ssh host names, or list them in the config file.\n\n{HELP}");
+    let (mut config, err) = config::load();
+    if let Some(e) = err {
+        eprintln!("gpudash: couldn't read the config file\n  {e}");
+        std::process::exit(1);
+    }
+    if let Some(n) = interval {
+        config.refresh_seconds = n;
+    }
+    if hosts.is_empty() && config.clusters.is_empty() {
+        eprint!("No clusters to watch yet. Pass ssh host names (gpudash mycluster), or add them to the config.\n\n{HELP}");
         std::process::exit(1);
     }
 
-    let mut app = App::new(clusters, Duration::from_secs(interval.max(5)));
+    let mut app = App::new(config, hosts);
     let mut terminal = ratatui::init();
     app.refresh();
     let result = run(&mut terminal, &mut app);
@@ -112,28 +81,61 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
                         Next::Continue => {}
                         Next::Quit => return Ok(()),
                         Next::Shell { host, workdir, running_id } => {
-                            ratatui::restore();
-                            println!("\n  gpudash → {host}:{workdir}  (exit the shell to come back)\n");
-                            if let Err(e) = remote::shell(&host, &workdir, running_id.as_deref()) {
-                                app.say(format!("shell failed: {e}"), true);
+                            suspend(terminal, || {
+                                println!("\n  gpudash → {host}:{workdir}  (exit the shell to come back)\n");
+                                remote::shell(&host, &workdir, running_id.as_deref())
+                            })?;
+                        }
+                        Next::EditConfig => {
+                            let Some(path) = config::path() else { continue };
+                            if !path.exists() {
+                                let _ = config::save(&app.config);
                             }
-                            *terminal = ratatui::init();
-                            terminal.clear()?;
+                            let editor = std::env::var("VISUAL")
+                                .or_else(|_| std::env::var("EDITOR"))
+                                .unwrap_or_else(|_| "vi".into());
+                            suspend(terminal, || {
+                                // $EDITOR may carry flags, e.g. "code --wait"
+                                std::process::Command::new("sh")
+                                    .arg("-c")
+                                    .arg(format!("{editor} \"$1\""))
+                                    .arg("sh")
+                                    .arg(&path)
+                                    .status()
+                                    .map(|_| ())
+                            })?;
+                            app.reload_config();
                         }
                     }
                 }
             }
         }
-        if !app.loading() && app.last_refresh.elapsed() >= app.interval {
+        if !app.paused && !app.loading() && app.last_refresh.elapsed() >= app.interval() {
             app.refresh();
         }
         app.tick += 1;
     }
 }
 
+/// Leave the full-screen view, run something in the normal terminal, then come back.
+fn suspend(terminal: &mut DefaultTerminal, f: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
+    ratatui::restore();
+    let result = f();
+    *terminal = ratatui::init();
+    terminal.clear()?;
+    if let Err(e) = result {
+        eprintln!("{e}");
+    }
+    Ok(())
+}
+
 fn on_key(app: &mut App, k: KeyEvent) -> Next {
     if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
         return Next::Quit;
+    }
+
+    if app.palette.is_some() {
+        return palette_key(app, k);
     }
 
     // popups take the key first
@@ -188,6 +190,7 @@ fn on_key(app: &mut App, k: KeyEvent) -> Next {
     }
 
     match k.code {
+        KeyCode::Char('k') | KeyCode::Char(':') => app.palette = Some(Palette::new()),
         KeyCode::Char('q') => return Next::Quit,
         KeyCode::Esc if !app.filter.is_empty() => {
             app.filter.clear();
@@ -196,7 +199,7 @@ fn on_key(app: &mut App, k: KeyEvent) -> Next {
         KeyCode::Esc => return Next::Quit,
         KeyCode::Char('r') => app.refresh(),
         KeyCode::Down | KeyCode::Char('j') => app.step(1),
-        KeyCode::Up | KeyCode::Char('k') => app.step(-1),
+        KeyCode::Up => app.step(-1),
         KeyCode::PageDown => app.step(10),
         KeyCode::PageUp => app.step(-10),
         KeyCode::Home | KeyCode::Char('g') => app.jump(false),
@@ -206,27 +209,77 @@ fn on_key(app: &mut App, k: KeyEvent) -> Next {
         KeyCode::Char('y') => app.copy_id(),
         KeyCode::Char('/') => app.filtering = true,
         KeyCode::Char('?') => app.popup = Some(Popup::Help),
-        KeyCode::Char('h') => {
-            let (next, msg) = match app.ended {
-                Ended::Recent => (Ended::All, "showing every job that ended in the last 24h"),
-                Ended::All => (Ended::Hidden, "hiding ended jobs"),
-                Ended::Hidden => (Ended::Recent, "showing the 5 most recent ended jobs"),
-            };
-            app.ended = next;
-            app.fix_selection();
-            app.say(msg, false);
+        KeyCode::Char('h') => app.cycle_ended(),
+        KeyCode::Char('n') => return app.run(palette::Cmd::ToggleNotify),
+        KeyCode::Char('s') => return app.shell_target(),
+        _ => {}
+    }
+    Next::Continue
+}
+
+fn palette_key(app: &mut App, k: KeyEvent) -> Next {
+    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+    let p = app.palette.as_mut().unwrap();
+
+    // text box (add cluster, set prefix)
+    if let Some(prompt) = p.prompt.as_mut() {
+        match k.code {
+            KeyCode::Esc => app.palette = None,
+            KeyCode::Enter => {
+                let prompt = app.palette.take().unwrap().prompt.unwrap();
+                app.submit_prompt(prompt);
+            }
+            KeyCode::Backspace => {
+                prompt.text.pop();
+            }
+            KeyCode::Char(c) => prompt.text.push(c),
+            _ => {}
         }
-        KeyCode::Char('n') => {
-            app.notify = !app.notify;
-            app.say(if app.notify { "notifications on" } else { "notifications off" }, false);
+        return Next::Continue;
+    }
+
+    let Some(level) = p.level() else {
+        app.palette = None;
+        return Next::Continue;
+    };
+    let (menu, query, sel) = (level.menu, level.query.clone(), level.sel);
+    let items: Vec<palette::Item> =
+        palette::search(app, menu, &query);
+    let last = items.len().saturating_sub(1);
+
+    let p = app.palette.as_mut().unwrap();
+    let depth = p.stack.len();
+    let level = p.level().unwrap();
+    match k.code {
+        KeyCode::Esc => {
+            p.stack.pop();
+            if p.stack.is_empty() {
+                app.palette = None;
+            }
         }
-        KeyCode::Char('s') => {
-            if let Some((_, c, j)) = app.selected_job() {
-                return Next::Shell {
-                    host: c.host.clone(),
-                    workdir: j.workdir.clone(),
-                    running_id: j.running().then(|| j.id.clone()),
-                };
+        KeyCode::Up => level.sel = sel.saturating_sub(1),
+        KeyCode::Down => level.sel = (sel + 1).min(last),
+        KeyCode::Char('p') if ctrl => level.sel = sel.saturating_sub(1),
+        KeyCode::Char('n') if ctrl => level.sel = (sel + 1).min(last),
+        KeyCode::Backspace => {
+            if level.query.pop().is_none() && depth > 1 {
+                p.stack.pop();
+            } else {
+                level.sel = 0;
+            }
+        }
+        KeyCode::Char(c) => {
+            level.query.push(c);
+            level.sel = 0;
+        }
+        KeyCode::Enter => {
+            let Some(it) = items.into_iter().nth(sel.min(last)) else { return Next::Continue };
+            match it.act {
+                Act::Open(menu) => p.open(menu),
+                Act::Run(cmd) => {
+                    app.palette = None;
+                    return app.run(cmd);
+                }
             }
         }
         _ => {}

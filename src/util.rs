@@ -1,5 +1,7 @@
 //! Small helpers: Slurm time parsing, formatting, colors.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use chrono::{DateTime, FixedOffset, Local, Utc};
 use ratatui::style::{Color, Style};
 use ratatui::text::Span;
@@ -14,6 +16,19 @@ pub const ORANGE: Color = Color::Rgb(255, 150, 60);
 pub const RED: Color = Color::Rgb(255, 80, 80);
 pub const ACCENT: Color = Color::Rgb(120, 170, 255);
 pub const SEL_BG: Color = Color::Rgb(38, 42, 54);
+pub const TRACK: Color = Color::Rgb(44, 48, 60);
+
+/// Display preferences read by the formatting helpers below (set from the config).
+pub static CLOCK_24H: AtomicBool = AtomicBool::new(false);
+pub static FAHRENHEIT: AtomicBool = AtomicBool::new(false);
+
+pub fn temp_text(celsius: u32) -> String {
+    if FAHRENHEIT.load(Ordering::Relaxed) {
+        format!("{}°F", (celsius as f64 * 9.0 / 5.0 + 32.0).round())
+    } else {
+        format!("{celsius}°")
+    }
+}
 
 /// temperature (°C) -> blue, green, yellow, orange, red
 pub fn temp_color(t: f64) -> Color {
@@ -47,6 +62,28 @@ pub fn bar(frac: f64, width: usize) -> Vec<Span<'static>> {
         Span::styled("━".repeat(filled), Style::new().fg(temp_color(40.0 + frac * 48.0))),
         Span::styled("━".repeat(width - filled), Style::new().fg(FAINT)),
     ]
+}
+
+/// A big solid bar for the detail panel. Each cell is colored by its position along the
+/// gradient, so a full bar sweeps from blue to red. Partial cells use eighth blocks.
+pub fn big_bar(frac: f64, width: usize) -> Vec<Span<'static>> {
+    const PARTS: [&str; 8] = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"];
+    let frac = frac.clamp(0.0, 1.0);
+    let cells = frac * width as f64;
+    let full = (cells.floor() as usize).min(width);
+    let part = ((cells - full as f64) * 8.0).round() as usize;
+    let at = |i: usize| temp_color(35.0 + i as f64 / width.max(1) as f64 * 55.0);
+    let mut spans: Vec<Span> = (0..full).map(|i| Span::styled("█", Style::new().fg(at(i)))).collect();
+    let mut used = full;
+    if full < width && part > 0 {
+        let glyph = if part >= 8 { "█" } else { PARTS[part] };
+        spans.push(Span::styled(glyph, Style::new().fg(at(full)).bg(TRACK)));
+        used += 1;
+    }
+    if used < width {
+        spans.push(Span::styled("█".repeat(width - used), Style::new().fg(TRACK)));
+    }
+    spans
 }
 
 /// (symbol, short label, color) for a Slurm state
@@ -108,7 +145,13 @@ pub fn dur(secs: Option<u64>) -> String {
 pub fn clock(t: DateTime<Utc>) -> String {
     let local = t.with_timezone(&Local);
     let far = (t - Utc::now()).num_seconds().abs() >= 86400;
-    local.format(if far { "%a %I:%M%P" } else { "%I:%M%P" }).to_string()
+    let fmt = match (CLOCK_24H.load(Ordering::Relaxed), far) {
+        (false, false) => "%I:%M%P",
+        (false, true) => "%a %I:%M%P",
+        (true, false) => "%H:%M",
+        (true, true) => "%a %H:%M",
+    };
+    local.format(fmt).to_string()
 }
 
 pub fn start_text(start: DateTime<Utc>) -> String {
