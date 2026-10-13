@@ -110,6 +110,9 @@ gpudash saves them, so next time plain `gpudash` shows them all.
 | `r`           | refresh now                                     |
 | `?`           | all keys                                        |
 | `q`           | quit                                            |
+| scroll wheel  | move, or scroll the log                         |
+
+gpudash uses the mouse wheel, so to select text in the terminal hold **Shift** while dragging.
 
 ## Configuration
 

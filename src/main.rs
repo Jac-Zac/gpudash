@@ -10,10 +10,14 @@ mod theme;
 mod ui;
 mod util;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ratatui::DefaultTerminal;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent,
+    MouseEventKind,
+};
+use ratatui::crossterm::execute;
 
 use app::{App, Next, Popup};
 use palette::{Act, Palette};
@@ -74,53 +78,76 @@ fn main() -> std::io::Result<()> {
     if let Some(e) = theme_error {
         app.say(e, true);
     }
-    let mut terminal = ratatui::init();
+    let mut terminal = init_terminal();
+    // if gpudash ever crashes, give the terminal its mouse back (ratatui's own hook does the rest)
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(std::io::stdout(), DisableMouseCapture);
+        previous(info);
+    }));
     app.refresh();
     let result = run(&mut terminal, &mut app);
-    ratatui::restore();
+    restore_terminal();
     result
+}
+
+/// Full-screen mode with mouse capture, so scroll-wheel events arrive as scrolling
+/// rather than as arrow keys the terminal makes up.
+fn init_terminal() -> DefaultTerminal {
+    let terminal = ratatui::init();
+    let _ = execute!(std::io::stdout(), EnableMouseCapture);
+    terminal
+}
+
+fn restore_terminal() {
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    ratatui::restore();
 }
 
 fn run(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
     loop {
         app.receive();
         terminal.draw(|f| ui::draw(f, app))?;
-        if event::poll(Duration::from_millis(80))? {
-            if let Event::Key(k) = event::read()? {
-                if k.kind == KeyEventKind::Press {
-                    match on_key(app, k) {
-                        Next::Continue => {}
-                        Next::Quit => return Ok(()),
-                        Next::Shell { host, workdir, running_id } => {
-                            suspend(terminal, || {
-                                println!("\n  gpudash → {host}:{workdir}  (exit the shell to come back)\n");
-                                remote::shell(&host, &workdir, running_id.as_deref())
-                            })?;
-                        }
-                        Next::EditConfig => {
-                            let Some(path) = config::path() else { continue };
-                            if !path.exists() {
-                                let _ = config::save(&app.config);
-                            }
-                            let editor = std::env::var("VISUAL")
-                                .or_else(|_| std::env::var("EDITOR"))
-                                .unwrap_or_else(|_| "vi".into());
-                            suspend(terminal, || {
-                                // $EDITOR may carry flags, e.g. "code --wait"
-                                std::process::Command::new("sh")
-                                    .arg("-c")
-                                    .arg(format!("{editor} \"$1\""))
-                                    .arg("sh")
-                                    .arg(&path)
-                                    .status()
-                                    .map(|_| ())
-                            })?;
-                            app.reload_config();
-                        }
+        // handle everything that's waiting, so fast scrolling or typing never lags behind
+        let mut wait = Duration::from_millis(80);
+        while event::poll(wait)? {
+            wait = Duration::ZERO;
+            let next = match event::read()? {
+                Event::Key(k) if k.kind == KeyEventKind::Press => on_key(app, k),
+                Event::Mouse(m) => on_mouse(app, m),
+                _ => Next::Continue,
+            };
+            match next {
+                Next::Continue => {}
+                Next::Quit => return Ok(()),
+                Next::Shell { host, workdir, running_id } => {
+                    suspend(terminal, || {
+                        println!("\n  gpudash → {host}:{workdir}  (exit the shell to come back)\n");
+                        remote::shell(&host, &workdir, running_id.as_deref())
+                    })?;
+                }
+                Next::EditConfig => {
+                    let Some(path) = config::path() else { continue };
+                    if !path.exists() {
+                        let _ = config::save(&app.config);
                     }
+                    let editor = std::env::var("VISUAL")
+                        .or_else(|_| std::env::var("EDITOR"))
+                        .unwrap_or_else(|_| "vi".into());
+                    suspend(terminal, || {
+                        // $EDITOR may carry flags, e.g. "code --wait"
+                        std::process::Command::new("sh")
+                            .arg("-c")
+                            .arg(format!("{editor} \"$1\""))
+                            .arg("sh")
+                            .arg(&path)
+                            .status()
+                            .map(|_| ())
+                    })?;
+                    app.reload_config();
                 }
             }
-        }
+}
         if !app.paused && !app.loading() && app.last_refresh.elapsed() >= app.interval() {
             app.refresh();
         }
@@ -130,14 +157,61 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
 
 /// Leave the full-screen view, run something in the normal terminal, then come back.
 fn suspend(terminal: &mut DefaultTerminal, f: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
-    ratatui::restore();
+    restore_terminal();
     let result = f();
-    *terminal = ratatui::init();
+    *terminal = init_terminal();
     terminal.clear()?;
     if let Err(e) = result {
         eprintln!("{e}");
     }
     Ok(())
+}
+
+/// Lines the log moves per scroll-wheel tick.
+const WHEEL_LINES: isize = 3;
+/// A trackpad keeps sending scroll events for a moment after a flick. Scroll events that
+/// arrive within this long of closing the log (or of the previous ignored one) are dropped,
+/// so they don't move the dashboard selection.
+const MOMENTUM: Duration = Duration::from_millis(400);
+
+fn on_mouse(app: &mut App, m: MouseEvent) -> Next {
+    let delta: isize = match m.kind {
+        MouseEventKind::ScrollUp => -1,
+        MouseEventKind::ScrollDown => 1,
+        _ => return Next::Continue,
+    };
+    if app.palette.is_some() {
+        // in the palette a wheel tick works like ↑ / ↓ (including the theme preview)
+        let code = if delta < 0 { KeyCode::Up } else { KeyCode::Down };
+        return palette_key(app, KeyEvent::new(code, KeyModifiers::NONE));
+    }
+    if app.popup.is_some() || app.filtering {
+        return Next::Continue;
+    }
+    if app.log.is_some() {
+        scroll_log(app, delta * WHEEL_LINES);
+        return Next::Continue;
+    }
+    if let Some(closed) = app.log_closed {
+        if closed.elapsed() < MOMENTUM {
+            app.log_closed = Some(Instant::now());
+            return Next::Continue;
+        }
+        app.log_closed = None;
+    }
+    app.step(delta);
+    Next::Continue
+}
+
+/// Move the log view by `delta` lines (negative = up). Reaching the end resumes following.
+fn scroll_log(app: &mut App, delta: isize) {
+    let Some(v) = app.log.as_mut() else { return };
+    let n = v.log.as_ref().map_or(0, |l| l.lines.len());
+    let height = ratatui::crossterm::terminal::size().map_or(30, |(_, h)| h as usize).saturating_sub(2);
+    let bottom = n.saturating_sub(height);
+    let top = v.top.unwrap_or(bottom) as isize;
+    let to = (top + delta).max(0) as usize;
+    v.top = if to >= bottom { None } else { Some(to) };
 }
 
 fn on_key(app: &mut App, k: KeyEvent) -> Next {
@@ -186,7 +260,10 @@ fn on_key(app: &mut App, k: KeyEvent) -> Next {
         let top = v.top.unwrap_or(bottom);
         let mut scroll = |to: usize| v.top = if to >= bottom { None } else { Some(to) };
         match k.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') | KeyCode::Left => app.log = None,
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') | KeyCode::Left => {
+                app.log = None;
+                app.log_closed = Some(Instant::now());
+            }
             KeyCode::Up | KeyCode::Char('k') => scroll(top.saturating_sub(1)),
             KeyCode::Down | KeyCode::Char('j') => scroll(top + 1),
             KeyCode::PageUp | KeyCode::Char('u') => scroll(top.saturating_sub(page)),

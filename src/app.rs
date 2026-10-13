@@ -74,6 +74,8 @@ pub struct App {
     cli_clusters: bool,
     next_uid: usize,
     pub paused: bool,
+    /// when the log view was last closed (to ignore leftover trackpad scrolling)
+    pub log_closed: Option<Instant>,
     /// theme currently on screen (differs from config.theme while previewing in the palette)
     pub theme_shown: String,
     pub palette: Option<Palette>,
@@ -113,6 +115,7 @@ impl App {
             cli_clusters,
             next_uid: 0,
             paused: false,
+            log_closed: None,
             theme_shown: String::new(),
             palette: None,
             filter: String::new(),
