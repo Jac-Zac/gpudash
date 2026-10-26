@@ -12,6 +12,7 @@ pub enum Menu {
     Unit,
     Clock,
     Theme,
+    Background,
     RemoveCluster,
     PrefixCluster,
 }
@@ -26,6 +27,7 @@ impl Menu {
             Menu::Unit => "Temperature unit",
             Menu::Clock => "Clock",
             Menu::Theme => "Theme",
+            Menu::Background => "Background poll interval",
             Menu::RemoveCluster => "Remove cluster",
             Menu::PrefixCluster => "Set folder prefix",
         }
@@ -56,6 +58,8 @@ pub enum Cmd {
     Clock(ClockFormat),
     ToggleGraph,
     Theme(String),
+    ToggleBackground,
+    BackgroundInterval(u64),
     OpenThemes,
     // clusters
     AddCluster,
@@ -132,6 +136,8 @@ pub fn items(app: &App, menu: Menu) -> Vec<Item> {
                 item("setting", "Notify when jobs are queued", on_off(c.notify_on_queue), Run(Cmd::ToggleNotifyQueue)),
                 item("setting", "Notify when a job starts", on_off(c.notify_on_start), Run(Cmd::ToggleNotifyStart)),
                 item("setting", "Notification sound", on_off(c.notify_sound), Run(Cmd::ToggleSound)),
+                item("setting", "Background notifications", on_off(c.background), Run(Cmd::ToggleBackground)),
+                item("setting", "Background poll interval…", interval_text(c.background_seconds), Open(Menu::Background)),
                 item("setting", "Temperature unit…", if c.temperature_unit == TempUnit::C { "°C" } else { "°F" }, Open(Menu::Unit)),
                 item("setting", "Clock…", if c.clock == ClockFormat::H12 { "12-hour" } else { "24-hour" }, Open(Menu::Clock)),
                 item("setting", "Temperature graph", on_off(c.temperature_graph), Run(Cmd::ToggleGraph)),
@@ -155,6 +161,10 @@ pub fn items(app: &App, menu: Menu) -> Vec<Item> {
         Menu::Interval => [10, 15, 30, 60, 120, 300]
             .into_iter()
             .map(|s| item("", format!("every {}", interval_text(s)), tick(c.refresh_seconds == s), Run(Cmd::Interval(s))))
+            .collect(),
+        Menu::Background => [60, 120, 300, 600, 900, 1800]
+            .into_iter()
+            .map(|s| item("", format!("every {}", interval_text(s)), tick(c.background_seconds == s), Run(Cmd::BackgroundInterval(s))))
             .collect(),
         Menu::Ended => [
             (Ended::Recent, format!("the {} most recent", c.recent_ended)),

@@ -8,12 +8,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, FixedOffset, NaiveDateTime, TimeZone, Utc};
+use serde::{Deserialize, Serialize};
 
 use crate::util::*;
 
 const CONTROL_PATH: &str = "ControlPath=~/.ssh/cm-%r@%h:%p";
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Gpu {
     pub name: String,
     pub temp: u32,
@@ -22,7 +23,7 @@ pub struct Gpu {
     pub mem_total: u32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Job {
     pub id: String,
     pub name: String,

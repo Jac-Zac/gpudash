@@ -9,13 +9,16 @@ use std::process::{Command, Stdio};
 /// Post a notification in the background (the first one may wait on macOS's permission prompt).
 pub fn notify(title: &str, body: &str, sound: bool) {
     let (title, body) = (title.to_string(), body.to_string());
-    std::thread::spawn(move || {
-        #[cfg(notifier)]
-        if bundle::post(&title, &body, sound) {
-            return;
-        }
-        osascript(&title, &body, sound);
-    });
+    std::thread::spawn(move || notify_blocking(&title, &body, sound));
+}
+
+/// Post a notification and wait until it's handed to macOS (for the background daemon).
+pub fn notify_blocking(title: &str, body: &str, sound: bool) {
+    #[cfg(notifier)]
+    if bundle::post(title, body, sound) {
+        return;
+    }
+    osascript(title, body, sound);
 }
 
 fn osascript(title: &str, body: &str, sound: bool) {

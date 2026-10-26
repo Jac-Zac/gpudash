@@ -292,13 +292,18 @@ impl App {
                 return;
             }
         };
+        // compare against the last snapshot, whether this dashboard or the background daemon took it
+        let previous = crate::background::load_seen(&c.host)
+            .map(|(when, jobs)| (Some(when), jobs))
+            .or_else(|| c.jobs.clone().map(|jobs| (None, jobs)));
         if self.config.notifications {
-            if let Some(old) = &c.jobs {
-                for (title, body) in job_changes(&c.host, old, &snap.jobs, &self.config) {
+            if let Some((since, old)) = &previous {
+                for (title, body) in job_changes(&c.host, old, &snap.jobs, *since, &self.config) {
                     notifier::notify(&title, &body, self.config.notify_sound);
                 }
             }
         }
+        crate::background::save_seen(&c.host, &snap.jobs);
         let before = c.outputs.len();
         c.outputs.extend(snap.outputs);
         if c.outputs.len() != before {
@@ -562,6 +567,22 @@ impl App {
                 let on = c.temperature_graph;
                 self.save(if on { "temperature graph on" } else { "temperature graph off" });
             }
+            Cmd::ToggleBackground => {
+                c.background = !c.background;
+                if c.background {
+                    self.save("background notifications on");
+                    if let Err(e) = crate::background::ensure() {
+                        self.say(format!("background notifications: {e}"), true);
+                    }
+                } else {
+                    crate::background::remove();
+                    self.save("background notifications off");
+                }
+            }
+            Cmd::BackgroundInterval(s) => {
+                c.background_seconds = s;
+                self.save(format!("polling every {} in the background", crate::palette::interval_text(s)));
+            }
             Cmd::Theme(name) => match crate::theme::apply(&name) {
                 Ok(()) => {
                     c.theme = name.clone();
@@ -671,53 +692,94 @@ impl App {
 
 /// Mac notification when a job starts, or leaves the queue.
 /// The notifications one poll should send, as (title, body).
-fn job_changes(host: &str, old: &[Job], new: &[Job], config: &Config) -> Vec<(String, String)> {
+/// The notifications one poll should send, as (title, body).
+/// `since` is when `old` was taken: jobs that ended after it are reported even if they were
+/// never seen running (short jobs between two background polls).
+pub fn job_changes(
+    host: &str,
+    old: &[Job],
+    new: &[Job],
+    since: Option<chrono::DateTime<chrono::Utc>>,
+    config: &Config,
+) -> Vec<(String, String)> {
     let mut out = Vec::new();
+    let seen = |id: &str| old.iter().any(|o| o.id == id);
 
     // new jobs since the last poll; several at once (e.g. a sweep) get one notification
-    let fresh: Vec<&Job> = new.iter().filter(|n| !n.finished() && !old.iter().any(|o| o.id == n.id)).collect();
+    let fresh: Vec<&Job> = new.iter().filter(|n| !n.finished() && !seen(&n.id)).collect();
     let (started, queued): (Vec<&Job>, Vec<&Job>) = fresh.into_iter().partition(|j| j.running());
     if config.notify_on_queue {
         if let [j] = queued.as_slice() {
             let when = j.start.map(crate::util::start_text).map(|t| format!(" · starts {t}")).unwrap_or_default();
             out.push((format!("◌ {} queued", j.name), format!("{host} · {}{when}", j.gpu_label)));
         } else if !queued.is_empty() {
-            let mut names: Vec<&str> = queued.iter().map(|j| j.name.as_str()).collect();
-            names.dedup();
-            let shown = names.iter().take(3).copied().collect::<Vec<_>>().join(", ");
-            let more = if names.len() > 3 { format!(" +{}", names.len() - 3) } else { String::new() };
-            out.push((format!("◌ {} jobs queued on {host}", queued.len()), format!("{shown}{more}")));
+            out.push((format!("◌ {} jobs queued on {host}", queued.len()), names(&queued)));
         }
     }
-    if config.notify_on_start {
+    let mut started: Vec<&Job> = if config.notify_on_start { started } else { Vec::new() };
+
+    let mut ended: Vec<&Job> = Vec::new();
+    for o in old.iter().filter(|o| !o.finished()) {
+        match new.iter().find(|n| n.id == o.id) {
+            Some(n) if o.pending() && n.running() && config.notify_on_start => started.push(n),
+            Some(n) if n.finished() => ended.push(n),
+            None => out.push((format!("{} left the queue", o.name), format!("{host} · job {}", o.id))),
+            _ => {}
+        }
+    }
+    // jobs that came and went entirely between two polls
+    if let Some(since) = since {
+        ended.extend(new.iter().filter(|n| !seen(&n.id) && n.end.is_some_and(|e| e > since)));
+    }
+
+    if started.len() > 3 {
+        out.push((format!("▶ {} jobs started on {host}", started.len()), names(&started)));
+    } else {
         for j in started {
             out.push((format!("▶ {} started", j.name), format!("{host} · job {}", j.id)));
         }
     }
 
-    for o in old.iter().filter(|o| !o.finished()) {
-        let now = new.iter().find(|n| n.id == o.id);
-        match now {
-            Some(n) if o.pending() && n.running() => {
-                if config.notify_on_start {
-                    out.push((format!("▶ {} started", o.name), format!("{host} · job {}", o.id)));
-                }
+    if ended.len() > 3 {
+        // one summary instead of a pile, e.g. after the laptop slept
+        let mut counts: Vec<(&str, usize)> = Vec::new();
+        for j in &ended {
+            let word = match j.state.as_str() {
+                "COMPLETED" => "done",
+                "CANCELLED" => "cancelled",
+                "TIMEOUT" => "timed out",
+                "OUT_OF_MEMORY" => "out of memory",
+                _ => "failed",
+            };
+            match counts.iter_mut().find(|(w, _)| *w == word) {
+                Some((_, n)) => *n += 1,
+                None => counts.push((word, 1)),
             }
-            Some(n) if n.finished() => {
-                let (title, body) = match n.state.as_str() {
-                    "COMPLETED" => (format!("✓ {} finished", n.name), String::new()),
-                    "CANCELLED" => (format!("{} cancelled", n.name), String::new()),
-                    "TIMEOUT" => (format!("⏱ {} hit its time limit", n.name), String::new()),
-                    "OUT_OF_MEMORY" => (format!("✗ {} ran out of memory", n.name), String::new()),
-                    s => (format!("✗ {} {}", n.name, s.to_lowercase()), format!("exit {} · ", n.exit)),
-                };
-                out.push((title, format!("{body}{host} · job {}", n.id)));
-            }
-            None => out.push((format!("{} left the queue", o.name), format!("{host} · job {}", o.id))),
-            _ => {}
+        }
+        let body = counts.iter().map(|(w, n)| format!("{n} {w}")).collect::<Vec<_>>().join(" · ");
+        out.push((format!("◼ {} jobs ended on {host}", ended.len()), body));
+    } else {
+        for n in ended {
+            let (title, body) = match n.state.as_str() {
+                "COMPLETED" => (format!("✓ {} finished", n.name), String::new()),
+                "CANCELLED" => (format!("{} cancelled", n.name), String::new()),
+                "TIMEOUT" => (format!("⏱ {} hit its time limit", n.name), String::new()),
+                "OUT_OF_MEMORY" => (format!("✗ {} ran out of memory", n.name), String::new()),
+                s => (format!("✗ {} {}", n.name, s.to_lowercase()), format!("exit {} · ", n.exit)),
+            };
+            out.push((title, format!("{body}{host} · job {}", n.id)));
         }
     }
     out
+}
+
+/// "sweep-lr, eval-big, probe +2" for a group notification.
+fn names(jobs: &[&Job]) -> String {
+    let mut names: Vec<&str> = jobs.iter().map(|j| j.name.as_str()).collect();
+    names.dedup();
+    let shown = names.iter().take(3).copied().collect::<Vec<_>>().join(", ");
+    let more = if names.len() > 3 { format!(" +{}", names.len() - 3) } else { String::new() };
+    format!("{shown}{more}")
 }
 
 // ---------- log path cache ----------
@@ -773,7 +835,7 @@ mod tests {
     fn one_new_job_is_named() {
         let old = vec![job("1", "a", "RUNNING")];
         let new = vec![job("1", "a", "RUNNING"), job("2", "sweep", "PENDING")];
-        let n = job_changes("explorer", &old, &new, &Config::default());
+        let n = job_changes("explorer", &old, &new, None, &Config::default());
         assert_eq!(n.len(), 1);
         assert_eq!(n[0].0, "◌ sweep queued");
     }
@@ -781,7 +843,7 @@ mod tests {
     #[test]
     fn many_new_jobs_are_grouped() {
         let new: Vec<Job> = (0..5).map(|i| job(&i.to_string(), "sweep", "PENDING")).collect();
-        let n = job_changes("explorer", &[], &new, &Config::default());
+        let n = job_changes("explorer", &[], &new, None, &Config::default());
         assert_eq!(n.len(), 1);
         assert_eq!(n[0].0, "◌ 5 jobs queued on explorer");
         assert_eq!(n[0].1, "sweep");
@@ -792,7 +854,33 @@ mod tests {
         let config = Config { notify_on_queue: false, notify_on_start: false, ..Config::default() };
         let old = vec![job("1", "a", "PENDING")];
         let new = vec![job("1", "a", "RUNNING"), job("2", "b", "PENDING")];
-        assert!(job_changes("x", &old, &new, &config).is_empty());
+        assert!(job_changes("x", &old, &new, None, &config).is_empty());
+    }
+
+    #[test]
+    fn many_endings_become_one_summary() {
+        let old: Vec<Job> = (0..6).map(|i| job(&i.to_string(), "sweep", "RUNNING")).collect();
+        let new: Vec<Job> = (0..6)
+            .map(|i| {
+                let mut j = job(&i.to_string(), "sweep", if i < 5 { "COMPLETED" } else { "FAILED" });
+                j.end = Some(chrono::Utc::now());
+                j
+            })
+            .collect();
+        let n = job_changes("explorer", &old, &new, None, &Config::default());
+        assert_eq!(n, [("◼ 6 jobs ended on explorer".to_string(), "5 done · 1 failed".to_string())]);
+    }
+
+    #[test]
+    fn short_job_between_polls_is_reported() {
+        let since = chrono::Utc::now() - chrono::Duration::minutes(5);
+        let mut quick = job("9", "quick", "COMPLETED");
+        quick.end = Some(chrono::Utc::now() - chrono::Duration::minutes(1));
+        let mut old_one = job("8", "old", "COMPLETED");
+        old_one.end = Some(chrono::Utc::now() - chrono::Duration::hours(3));
+        let n = job_changes("x", &[], &[quick, old_one], Some(since), &Config::default());
+        let titles: Vec<&str> = n.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(titles, ["✓ quick finished"]);
     }
 
     #[test]
@@ -802,7 +890,7 @@ mod tests {
         done.end = Some(chrono::Utc::now());
         done.exit = "1:0".into();
         let new = vec![job("1", "a", "RUNNING"), done];
-        let n = job_changes("x", &old, &new, &Config::default());
+        let n = job_changes("x", &old, &new, None, &Config::default());
         let titles: Vec<&str> = n.iter().map(|(t, _)| t.as_str()).collect();
         assert_eq!(titles, ["▶ a started", "✗ b failed"]);
     }

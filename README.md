@@ -24,6 +24,12 @@ A notification when jobs are **queued**, **start**, **finish**, **fail**, run **
 memory** or hit their **time limit**. When an agent submits a batch at once, you get one
 notification ("6 jobs queued on explorer"), not six. Each kind can be turned off.
 
+**Keeps working after you close it.** After the first run, gpudash keeps polling in the
+background (every 5 minutes) and notifies you even when the dashboard isn't open, including
+short jobs that started and finished between two checks. If many jobs end while your laptop
+sleeps, you get one summary ("12 jobs ended on explorer: 10 done · 2 failed"). Turn it off
+with `gpudash background off` or `p` → *Background notifications*.
+
 ### Live GPU readings
 
 ![usage and memory bars with a temperature graph](assets/screenshots/detail.png)
@@ -77,6 +83,9 @@ cargo install --git https://github.com/RollingRo11/gpudash --force   # or, in a 
 
 `gpudash --version` shows which commit you're running.
 
+The first time you open gpudash it also registers itself to start at login and poll in
+the background (`gpudash background status` shows it, the log is `~/Library/Logs/gpudash.log`).
+
 On macOS this also builds a small notification app that puts the gpudash icon on
 notifications. It's set up the first time a notification is sent; click **Allow** when
 macOS asks.
@@ -121,7 +130,9 @@ these are the defaults:
 
 ```toml
 theme = "default"           # any file in ~/.config/gpudash/themes/
-refresh_seconds = 30
+refresh_seconds = 30        # while the dashboard is open
+background = true           # keep notifying after it closes (macOS)
+background_seconds = 300    # how often to poll in the background
 ended_jobs = "recent"       # "recent", "all" or "hidden"
 recent_ended = 5
 notifications = true
@@ -174,6 +185,11 @@ Each refresh sends one small script to each cluster's login node over ssh:
 
 Notifications come from a tiny Swift app ([`notifier/main.swift`](notifier/main.swift)),
 because macOS shows the Script Editor icon on anything sent with `osascript`.
+
+In the background, a launchd agent (`~/Library/LaunchAgents/io.github.rollingro11.gpudash.plist`)
+runs `gpudash daemon`. While the dashboard is open it stands by and the dashboard notifies;
+both share a "last seen" snapshot per cluster in `~/.cache/gpudash/`, so nothing is missed or
+sent twice when one hands over to the other.
 
 ## Requirements
 

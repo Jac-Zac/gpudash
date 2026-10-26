@@ -1,6 +1,7 @@
 //! gpudash — live terminal dashboard for your Slurm jobs across clusters.
 
 mod app;
+mod background;
 mod config;
 mod highlight;
 mod notifier;
@@ -26,9 +27,13 @@ const HELP: &str = "\
 gpudash — live dashboard for your Slurm jobs across clusters
 
 usage: gpudash [-n SECONDS] [HOST ...]   (gpudash --version shows the build)
+       gpudash background on|off|status
 
   HOST        ssh host names to watch (default: the clusters in the config file)
   -n SECONDS  how often to refresh (overrides the config for this run)
+
+After the first run gpudash keeps sending notifications in the background (macOS),
+polling every 5 minutes while the dashboard is closed. `gpudash background off` stops that.
 
 config: ~/.config/gpudash/config.toml
   Press p inside gpudash to change settings and add or remove clusters.
@@ -40,7 +45,15 @@ config: ~/.config/gpudash/config.toml
 ";
 
 fn main() -> std::io::Result<()> {
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args().skip(1).peekable();
+    match args.peek().map(String::as_str) {
+        Some("daemon") => background::run_daemon(),
+        Some("background") => {
+            args.next();
+            return background_command(args.next().as_deref());
+        }
+        _ => {}
+    }
     let mut interval = None;
     let mut hosts = Vec::new();
     while let Some(a) = args.next() {
@@ -85,10 +98,43 @@ fn main() -> std::io::Result<()> {
         let _ = execute!(std::io::stdout(), DisableMouseCapture);
         previous(info);
     }));
+    if app.config.background {
+        match background::ensure() {
+            Ok(true) => app.say("gpudash will keep sending notifications after you close it (p → Background to change)", false),
+            Ok(false) => {}
+            Err(e) => app.say(format!("background notifications: {e}"), true),
+        }
+    }
+    background::heartbeat();
     app.refresh();
     let result = run(&mut terminal, &mut app);
+    background::heartbeat_stop();
     restore_terminal();
     result
+}
+
+/// `gpudash background on|off|status`
+fn background_command(what: Option<&str>) -> std::io::Result<()> {
+    let (mut config, _) = config::load();
+    match what {
+        Some("on") => {
+            config.background = true;
+            let _ = config::save(&config);
+            match background::ensure() {
+                Ok(_) => println!("background notifications on"),
+                Err(e) => println!("couldn't turn on background notifications: {e}"),
+            }
+        }
+        Some("off") => {
+            config.background = false;
+            let _ = config::save(&config);
+            background::remove();
+            println!("background notifications off");
+        }
+        Some("status") | None => println!("{}", background::status_text()),
+        Some(other) => println!("unknown option \"{other}\": use on, off or status"),
+    }
+    Ok(())
 }
 
 /// Full-screen mode with mouse capture, so scroll-wheel events arrive as scrolling
@@ -148,6 +194,10 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
                 }
             }
 }
+        if app.tick % 100 == 0 {
+            // about every 8s: tell the background daemon the dashboard is open
+            background::heartbeat();
+        }
         if !app.paused && !app.loading() && app.last_refresh.elapsed() >= app.interval() {
             app.refresh();
         }

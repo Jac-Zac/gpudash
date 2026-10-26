@@ -41,6 +41,8 @@ pub struct ClusterConf {
 pub struct Config {
     pub theme: String,
     pub refresh_seconds: u64,
+    pub background: bool,
+    pub background_seconds: u64,
     pub ended_jobs: Ended,
     pub recent_ended: usize,
     pub notifications: bool,
@@ -59,6 +61,8 @@ impl Default for Config {
         Config {
             theme: "default".into(),
             refresh_seconds: 30,
+            background: true,
+            background_seconds: 300,
             ended_jobs: Ended::Recent,
             recent_ended: 5,
             notifications: true,
@@ -77,7 +81,9 @@ const HEADER: &str = "\
 # gpudash settings. Edit by hand, or press p in gpudash to change them from the command palette.
 #
 # theme              a theme from the themes/ folder next to this file (\"default\", \"light\", \"nord\"…)
-# refresh_seconds    how often to poll the clusters
+# refresh_seconds    how often to poll the clusters while the dashboard is open
+# background         keep sending notifications after the dashboard closes (macOS)
+# background_seconds how often to poll in the background
 # ended_jobs         \"recent\", \"all\" or \"hidden\": jobs that ended in the last 24h
 # recent_ended       how many ended jobs per cluster \"recent\" shows
 # notifications      macOS notifications when jobs start / end

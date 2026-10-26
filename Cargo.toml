@@ -14,8 +14,9 @@ lto = true
 strip = true
 
 [dependencies]
-chrono = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
 ratatui = "0.29"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "0.8"
