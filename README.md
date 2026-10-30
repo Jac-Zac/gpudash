@@ -42,7 +42,8 @@ job gets big usage and memory bars and a temperature graph.
 ![a colored job log](assets/screenshots/log.png)
 
 `enter` opens the job's log: colored, scrollable, and following the end while the job runs.
-It finds logs even after Slurm has forgotten the job.
+It finds logs even after Slurm has forgotten the job. Unchanged logs stay on screen without
+being downloaded again; `r` forces a fresh read.
 
 ### Command palette
 

@@ -298,18 +298,33 @@ fn parse_gpus(out: &str) -> HashMap<String, Vec<Gpu>> {
     gpus
 }
 
+#[derive(Debug)]
 pub struct Log {
     pub path: String,
     pub size: u64,
     pub lines: Vec<String>,
+    pub stamp: String,
 }
 
-/// Tail a job's stdout (or stderr). `pattern` is a fallback path pattern we saw earlier from squeue,
-/// used once Slurm has forgotten the job.
-pub fn fetch_log(host: &str, id: &str, name: &str, workdir: &str, pattern: &str, stderr: bool) -> Result<Log, String> {
-    let script = format!(
-        r#"
+/// Inputs for resolving and tailing a job's stdout or stderr.
+pub struct LogRequest<'a> {
+    pub id: &'a str,
+    pub name: &'a str,
+    pub workdir: &'a str,
+    /// Fallback path pattern saved from squeue, used once Slurm forgets the job.
+    pub pattern: &'a str,
+    pub stderr: bool,
+    /// Last displayed path and file metadata; None forces a full read.
+    pub known: Option<(&'a str, &'a str)>,
+}
+
+impl LogRequest<'_> {
+    fn script(&self) -> String {
+        let (path, stamp) = self.known.unwrap_or_default();
+        format!(
+            r#"
 id={id}; name={name}; pat={pat}; key={key}; wd={wd}
+known_path={path}; known_stamp={stamp}
 p=$(scontrol show job -o "$id" 2>/dev/null | tr ' ' '\n' | sed -n "s/^$key=//p")
 case "$p" in ""|"(null)") p=$(sacct -j "$id" -X -n -P -o "$key" 2>/dev/null | head -1);; esac
 case "$p" in ""|"(null)") p="$pat";; esac
@@ -323,26 +338,50 @@ fi
 echo "@@PATH|$p"
 if [ -z "$p" ]; then echo "@@ERR|Slurm no longer knows where this job's log is"
 elif [ ! -r "$p" ]; then echo "@@ERR|can't read $p"
-else echo "@@SIZE|$(stat -c %s "$p")"; tail -n 3000 "$p"; fi
+else
+  stamp=$(stat -c '%s|%i|%y|%z' "$p" 2>/dev/null)
+  if [ -n "$stamp" ] && [ "$p" = "$known_path" ] && [ "$stamp" = "$known_stamp" ]; then
+    echo "@@UNCHANGED"
+  else
+    echo "@@STAMP|$stamp"
+    echo "@@SIZE|${{stamp%%|*}}"
+    tail -n 3000 "$p"
+  fi
+fi
 "#,
-        id = sh_quote(id),
-        name = sh_quote(name),
-        pat = sh_quote(pattern),
-        key = if stderr { "StdErr" } else { "StdOut" },
-        wd = sh_quote(workdir),
-    );
-    let out = run(host, &script)?;
+            id = sh_quote(self.id),
+            name = sh_quote(self.name),
+            pat = sh_quote(self.pattern),
+            key = if self.stderr { "StdErr" } else { "StdOut" },
+            wd = sh_quote(self.workdir),
+            path = sh_quote(path),
+            stamp = sh_quote(stamp),
+        )
+    }
+}
+
+/// None means the displayed file is unchanged; keep its existing lines.
+pub fn fetch_log(host: &str, request: &LogRequest<'_>) -> Result<Option<Log>, String> {
+    parse_log(&run(host, &request.script())?)
+}
+
+fn parse_log(out: &str) -> Result<Option<Log>, String> {
+    let mut stamp = String::new();
     let mut path = String::new();
     let mut lines = out.lines();
     for line in lines.by_ref() {
         if let Some(p) = line.strip_prefix("@@PATH|") {
             path = p.to_string();
+        } else if line == "@@UNCHANGED" {
+            return Ok(None);
+        } else if let Some(s) = line.strip_prefix("@@STAMP|") {
+            stamp = s.to_string();
         } else if let Some(e) = line.strip_prefix("@@ERR|") {
             return Err(e.to_string());
         } else if let Some(s) = line.strip_prefix("@@SIZE|") {
             let size = s.trim().parse().unwrap_or(0);
             let lines = lines.map(clean_log_line).collect();
-            return Ok(Log { path, size, lines });
+            return Ok(Some(Log { path, size, lines, stamp }));
         }
     }
     Err("no log output".into())
@@ -396,6 +435,49 @@ mod tests {
         let out = Command::new("bash").args(["-c", script]).output().unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         String::from_utf8(out.stdout).unwrap()
+    }
+
+    #[test]
+    fn log_polls_skip_only_the_same_file_metadata() {
+        let read = |contents: &str, stamp: &str, known, pattern: &str, forbid_tail| {
+            let request = LogRequest {
+                id: "42", name: "train", workdir: "", pattern, stderr: false, known,
+            };
+            let out = bash(&format!(r#"
+t=$(mktemp -d)
+trap 'rm -rf "$t"' EXIT
+cd "$t"
+printf '%s' {contents} > train.log
+scontrol() {{ :; }}
+sacct() {{ :; }}
+stat() {{ printf '%s\n' {stamp}; }}
+tail() {{ {tail} }}
+{script}"#,
+                contents = sh_quote(contents), stamp = sh_quote(stamp),
+                tail = if forbid_tail { "echo 'tail must not run' >&2; exit 1;" } else { r#"command tail "$@";"# },
+                script = request.script(),
+            ));
+            parse_log(&out)
+        };
+        let stamp = "4|123|mtime|ctime";
+        let first = read("old\n", stamp, None, "train.log", false).unwrap().unwrap();
+        assert_eq!(first.lines, ["old"]);
+        assert_eq!(first.size, 4);
+        let known = Some((first.path.as_str(), first.stamp.as_str()));
+        assert!(read("old\n", stamp, known, "train.log", true).unwrap().is_none());
+        let appended = read("old\nnew\n", "8|123|later|later", known, "train.log", false).unwrap().unwrap();
+        assert_eq!(appended.lines, ["old", "new"]);
+        let rewritten = read("new\n", "4|123|later|later", known, "train.log", false).unwrap().unwrap();
+        assert_eq!(rewritten.lines, ["new"]);
+        let truncated = read("", "0|123|later|later", known, "train.log", false).unwrap().unwrap();
+        assert!(truncated.lines.is_empty());
+        // A new path with matching metadata must still be read.
+        assert!(read("old\n", stamp, Some(("other.log", stamp)), "train.log", false).unwrap().is_some());
+        // No known metadata means a manual or final read always transfers the lines.
+        assert!(read("old\n", stamp, None, "train.log", false).unwrap().is_some());
+        assert!(read("old\n", stamp, known, "missing.log", true).unwrap_err().contains("can't read"));
+        // If stat fails, fall back to tailing instead of treating it as unchanged.
+        assert!(read("old\n", "", Some(("train.log", "")), "train.log", false).unwrap().is_some());
     }
 
     #[test]

@@ -68,7 +68,7 @@ pub enum Next {
 pub enum Msg {
     Jobs(usize, Result<Snapshot, String>), // (cluster uid, result)
     Gpus(usize, Result<HashMap<String, Vec<Gpu>>, String>), // (cluster uid, job id -> GPUs)
-    Log(String, bool, Result<Log, String>),
+    Log(String, bool, Result<Option<Log>, String>),
     Cancelled(String, Result<(), String>),
 }
 
@@ -297,7 +297,9 @@ impl App {
                         v.fetched = Instant::now();
                         match result {
                             Ok(log) => {
-                                v.log = Some(log);
+                                if let Some(log) = log {
+                                    v.log = Some(log);
+                                }
                                 v.error = None;
                             }
                             Err(e) => v.error = Some(e),
@@ -474,6 +476,10 @@ impl App {
     }
 
     pub fn fetch_log(&mut self) {
+        self.fetch_log_inner(false);
+    }
+
+    fn fetch_log_inner(&mut self, skip_unchanged: bool) {
         let Some(v) = self.log.as_mut() else { return };
         if v.loading {
             return;
@@ -486,8 +492,14 @@ impl App {
         v.fetched_running = job.is_some_and(|j| j.running());
         let workdir = job.map_or(String::new(), |j| j.workdir.clone());
         let (tx, host, id, name, stderr) = (self.tx.clone(), c.host.clone(), v.id.clone(), v.name.clone(), v.stderr);
+        let known = v.log.as_ref().filter(|_| skip_unchanged && v.fetched_running)
+            .map(|log| (log.path.clone(), log.stamp.clone()));
         thread::spawn(move || {
-            let r = remote::fetch_log(&host, &id, &name, &workdir, &pattern, stderr);
+            let request = remote::LogRequest {
+                id: &id, name: &name, workdir: &workdir, pattern: &pattern, stderr,
+                known: known.as_ref().map(|(path, stamp)| (path.as_str(), stamp.as_str())),
+            };
+            let r = remote::fetch_log(&host, &request);
             let _ = tx.send(Msg::Log(id, stderr, r));
         });
     }
@@ -501,7 +513,7 @@ impl App {
             .flatten()
             .any(|j| j.id == v.id && j.running());
         if (running || v.fetched_running) && !v.loading && v.fetched.elapsed() >= LOG_REFRESH {
-            self.fetch_log();
+            self.fetch_log_inner(true);
         }
     }
 
@@ -894,6 +906,28 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_log_reply_preserves_lines_and_scroll() {
+        let mut app = App::new(Config::default(), Vec::new());
+        let mut c = test_cluster(0);
+        c.jobs = Some(vec![job("42", "train", "RUNNING")]);
+        app.clusters.push(c);
+        app.log = Some(LogView {
+            ci: 0, id: "42".into(), name: "train".into(), stderr: false,
+            log: Some(Log { path: "train.log".into(), size: 4, lines: vec!["old".into()], stamp: "stamp".into() }),
+            error: Some("previous error".into()), loading: true,
+            fetched: Instant::now() - LOG_REFRESH, fetched_running: true, top: Some(0),
+        });
+        app.tx.send(Msg::Log("42".into(), false, Ok(None))).unwrap();
+        app.receive();
+        let view = app.log.as_ref().unwrap();
+        assert_eq!(view.log.as_ref().unwrap().lines, ["old"]);
+        assert_eq!(view.top, Some(0));
+        assert!(!view.loading);
+        assert!(view.error.is_none());
+        assert!(view.fetched.elapsed() < LOG_REFRESH);
+    }
+
+    #[test]
     fn clusters_refresh_on_their_own_timers() {
         let mut app = App::new(Config::default(), Vec::new());
         let interval = app.interval();
@@ -919,6 +953,15 @@ mod tests {
             app.clusters.push(c);
         }
         let gpu = Gpu { name: "H200".into(), temp: 50, util: 90, mem_used: 100, mem_total: 200 };
+        app.clusters[1].jobs.as_mut().unwrap()[0].gpus.push(gpu.clone());
+        app.tx.send(Msg::Jobs(1, Ok(Snapshot {
+            jobs: vec![job("42", "train", "RUNNING"), job("43", "eval", "PENDING")],
+            outputs: HashMap::new(),
+        }))).unwrap();
+        app.receive();
+        assert!(app.clusters[1].loading, "GPU fetch still pending");
+        assert_eq!(app.clusters[1].jobs.as_ref().unwrap()[0].gpus[0].temp, 50);
+        assert!(!app.temp_history.contains_key(&(1, "42".into())), "only fresh GPU readings enter history");
         app.tx.send(Msg::Gpus(1, Ok(HashMap::from([("42".into(), vec![gpu])])))).unwrap();
         app.receive();
         assert!(app.clusters[0].loading);
