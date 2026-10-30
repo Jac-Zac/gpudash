@@ -11,7 +11,7 @@ use std::sync::atomic::Ordering;
 use crate::config::{self, ClockFormat, ClusterConf, Config, Ended, TempUnit};
 use crate::notifier;
 use crate::palette::{Cmd, Palette, Prompt, PromptKind};
-use crate::remote::{self, Job, Log, Snapshot};
+use crate::remote::{self, Gpu, Job, Log, Snapshot};
 use crate::util::{CLOCK_24H, FAHRENHEIT};
 
 const HISTORY_LEN: usize = 120;
@@ -27,8 +27,21 @@ pub struct Cluster {
     pub error: Option<String>,
     pub loading: bool,
     pub loading_since: Instant,
+    poll_started: bool,
+    /// start of the poll whose GPU readings are still on the way
+    probing: Option<Instant>,
+    /// last GPU check failed, so the readings shown are from an earlier poll
+    pub gpu_error: Option<String>,
     /// job id -> (stdout, stderr) path patterns; kept on disk so logs of old jobs stay reachable
     pub outputs: HashMap<String, (String, String)>,
+}
+
+impl Cluster {
+    fn due(&self, interval: Duration, force: bool) -> bool {
+        // a manual refresh doesn't wait for GPU readings; a newer poll replaces them
+        !self.loading
+            && (force || (self.probing.is_none() && (!self.poll_started || self.loading_since.elapsed() >= interval)))
+    }
 }
 
 pub struct LogView {
@@ -40,6 +53,8 @@ pub struct LogView {
     pub error: Option<String>,
     pub loading: bool,
     pub fetched: Instant,
+    request: u64,
+    final_refresh: bool,
     /// first visible line; None = follow the end
     pub top: Option<usize>,
 }
@@ -59,7 +74,8 @@ pub enum Next {
 
 pub enum Msg {
     Jobs(usize, Result<Snapshot, String>), // (cluster uid, result)
-    Log(String, bool, Result<Log, String>),
+    Gpus(usize, Instant, Result<HashMap<String, Vec<Gpu>>, String>), // (cluster uid, poll start, result)
+    Log(u64, Result<Option<Log>, String>),
     Cancelled(String, Result<(), String>),
 }
 
@@ -68,7 +84,7 @@ pub struct App {
     pub selected: Option<(usize, String)>, // (cluster index, job id)
     moved: bool,                           // user has moved the selection
     pub tick: usize,
-    pub last_refresh: Instant,
+    next_log_request: u64,
     pub config: Config,
     /// clusters came from the command line, so cluster edits aren't saved
     cli_clusters: bool,
@@ -110,7 +126,7 @@ impl App {
             selected: None,
             moved: false,
             tick: 0,
-            last_refresh: Instant::now(),
+            next_log_request: 0,
             config,
             cli_clusters,
             next_uid: 0,
@@ -145,6 +161,9 @@ impl App {
             error: None,
             loading: false,
             loading_since: Instant::now(),
+            poll_started: false,
+            probing: None,
+            gpu_error: None,
         });
         self.next_uid += 1;
     }
@@ -225,18 +244,44 @@ impl App {
     }
 
     pub fn refresh(&mut self) {
+        self.refresh_clusters(true);
+    }
+
+    pub fn auto_refresh(&mut self) {
+        if !self.paused {
+            self.refresh_clusters(false);
+        }
+    }
+
+    fn refresh_clusters(&mut self, force: bool) {
+        let interval = self.interval();
         for c in self.clusters.iter_mut() {
-            if c.loading {
+            if !c.due(interval, force) {
                 continue;
             }
             c.loading = true;
+            c.poll_started = true;
             c.loading_since = Instant::now();
-            let (tx, host, uid) = (self.tx.clone(), c.host.clone(), c.uid);
+            let (tx, host, uid, started) = (self.tx.clone(), c.host.clone(), c.uid, c.loading_since);
             thread::spawn(move || {
-                let _ = tx.send(Msg::Jobs(uid, remote::fetch_jobs(&host)));
+                let result = remote::fetch_jobs(&host);
+                let ids = result.as_ref().map(|s| {
+                    s.jobs.iter().filter(|j| j.running()).map(|j| j.id.clone()).collect::<Vec<_>>()
+                }).unwrap_or_default();
+                let ok = result.is_ok();
+                if tx.send(Msg::Jobs(uid, result)).is_err() || !ok {
+                    return;
+                }
+                let _ = tx.send(Msg::Gpus(uid, started, remote::fetch_gpus(&host, &ids)));
             });
         }
-        self.last_refresh = Instant::now();
+    }
+
+    pub fn next_refresh(&self) -> Duration {
+        let interval = self.interval();
+        self.clusters.iter().filter(|c| !c.loading && c.probing.is_none())
+            .map(|c| interval.saturating_sub(c.loading_since.elapsed()))
+            .min().unwrap_or_default()
     }
 
     pub fn loading(&self) -> bool {
@@ -256,14 +301,22 @@ impl App {
                         self.got_jobs(i, result);
                     }
                 }
-                Msg::Log(id, stderr, result) => {
-                    if let Some(v) = self.log.as_mut().filter(|v| v.id == id && v.stderr == stderr) {
+                Msg::Gpus(uid, started, result) => {
+                    if let Some(i) = self.clusters.iter().position(|c| c.uid == uid && c.probing == Some(started)) {
+                        self.got_gpus(i, result);
+                    }
+                }
+                Msg::Log(request, result) => {
+                    if let Some(v) = self.log.as_mut().filter(|v| v.request == request) {
                         v.loading = false;
                         v.fetched = Instant::now();
                         match result {
                             Ok(log) => {
-                                v.log = Some(log);
+                                if let Some(log) = log {
+                                    v.log = Some(log);
+                                }
                                 v.error = None;
+                                v.final_refresh = false;
                             }
                             Err(e) => v.error = Some(e),
                         }
@@ -285,7 +338,8 @@ impl App {
     fn got_jobs(&mut self, i: usize, result: Result<Snapshot, String>) {
         let c = &mut self.clusters[i];
         c.loading = false;
-        let snap = match result {
+        c.probing = None;
+        let mut snap = match result {
             Ok(s) => s,
             Err(e) => {
                 c.error = Some(e);
@@ -309,17 +363,51 @@ impl App {
         if c.outputs.len() != before {
             save_outputs(&c.host, &c.outputs);
         }
-        for j in snap.jobs.iter().filter(|j| !j.gpus.is_empty()) {
-            let max = j.gpus.iter().map(|g| g.temp as u64).max().unwrap_or(0);
-            let h = self.temp_history.entry((i, j.id.clone())).or_default();
-            h.push(max);
-            if h.len() > HISTORY_LEN {
-                h.remove(0);
+        // Keep the previous readings visible until this poll's GPU probes finish.
+        for j in snap.jobs.iter_mut().filter(|j| j.running()) {
+            if let Some(old) = c.jobs.iter().flatten().find(|old| old.id == j.id && old.start == j.start) {
+                j.gpus = old.gpus.clone();
+            }
+        }
+        if let Some(v) = self.log.as_mut().filter(|v| v.ci == i) {
+            let was_running = c.jobs.iter().flatten().any(|j| j.id == v.id && j.running());
+            let is_running = snap.jobs.iter().any(|j| j.id == v.id && j.running());
+            if was_running && !is_running {
+                v.final_refresh = true;
+                v.loading = false;
             }
         }
         c.jobs = Some(snap.jobs);
         c.fetched = Some(Instant::now());
         c.error = None;
+        c.probing = Some(c.loading_since);
+        if self.log.as_ref().is_some_and(|v| v.final_refresh && v.ci == i) {
+            self.fetch_log_inner(false);
+        }
+    }
+
+    fn got_gpus(&mut self, i: usize, result: Result<HashMap<String, Vec<Gpu>>, String>) {
+        let c = &mut self.clusters[i];
+        c.probing = None;
+        // GPU failures must not turn a successful job-state refresh into a cluster error.
+        let mut gpus = match result {
+            Ok(g) => g,
+            Err(e) => {
+                c.gpu_error = Some(e);
+                return;
+            }
+        };
+        c.gpu_error = None;
+        for j in c.jobs.iter_mut().flatten().filter(|j| j.running()) {
+            j.gpus = gpus.remove(&j.id).unwrap_or_default();
+            if let Some(max) = j.gpus.iter().map(|g| g.temp as u64).max() {
+                let h = self.temp_history.entry((i, j.id.clone())).or_default();
+                h.push(max);
+                if h.len() > HISTORY_LEN {
+                    h.remove(0);
+                }
+            }
+        }
     }
 
     /// Jobs of one cluster that pass the current filter / finished toggle.
@@ -405,6 +493,8 @@ impl App {
             error: None,
             loading: false,
             fetched: Instant::now(),
+            request: 0,
+            final_refresh: false,
             top: None,
         });
         self.fetch_log();
@@ -413,6 +503,7 @@ impl App {
     pub fn toggle_log_stream(&mut self) {
         if let Some(v) = self.log.as_mut() {
             v.stderr = !v.stderr;
+            v.loading = false;
             v.log = None;
             v.error = None;
             v.top = None;
@@ -421,19 +512,29 @@ impl App {
     }
 
     pub fn fetch_log(&mut self) {
+        self.fetch_log_inner(true);
+    }
+
+    fn fetch_log_inner(&mut self, force: bool) {
         let Some(v) = self.log.as_mut() else { return };
         if v.loading {
             return;
         }
         v.loading = true;
+        self.next_log_request += 1;
+        v.request = self.next_log_request;
+        let request = v.request;
+        let previous = if force { None } else {
+            v.log.as_ref().map(|l| (l.path.clone(), l.fingerprint.clone()))
+        };
         let c = &self.clusters[v.ci];
         let (out, err) = c.outputs.get(&v.id).cloned().unwrap_or_default();
         let pattern = if v.stderr { err } else { out };
         let workdir = c.jobs.iter().flatten().find(|j| j.id == v.id).map_or(String::new(), |j| j.workdir.clone());
         let (tx, host, id, name, stderr) = (self.tx.clone(), c.host.clone(), v.id.clone(), v.name.clone(), v.stderr);
         thread::spawn(move || {
-            let r = remote::fetch_log(&host, &id, &name, &workdir, &pattern, stderr);
-            let _ = tx.send(Msg::Log(id, stderr, r));
+            let r = remote::fetch_log(&host, &id, &name, &workdir, &pattern, stderr, previous.as_ref());
+            let _ = tx.send(Msg::Log(request, r));
         });
     }
 
@@ -445,8 +546,8 @@ impl App {
             .iter()
             .flatten()
             .any(|j| j.id == v.id && j.running());
-        if running && !v.loading && v.fetched.elapsed() >= LOG_REFRESH {
-            self.fetch_log();
+        if (running || v.final_refresh) && !v.loading && v.fetched.elapsed() >= LOG_REFRESH {
+            self.fetch_log_inner(false);
         }
     }
 
@@ -829,6 +930,91 @@ mod tests {
             exit: String::new(),
             gpus: Vec::new(),
         }
+    }
+
+    fn test_cluster(uid: usize) -> Cluster {
+        Cluster {
+            uid, host: "test".into(), prefix: String::new(), jobs: None, fetched: None,
+            error: None, loading: false, loading_since: Instant::now(), poll_started: true,
+            probing: None, gpu_error: None, outputs: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn cluster_schedule_is_independent_and_prevents_overlapping_polls() {
+        let mut slow = test_cluster(0);
+        slow.loading = true;
+        slow.loading_since -= Duration::from_secs(60);
+        let mut healthy = test_cluster(1);
+        healthy.loading_since -= Duration::from_secs(31);
+        let interval = Duration::from_secs(30);
+        assert!(!slow.due(interval, false));
+        assert!(!slow.due(interval, true));
+        assert!(healthy.due(interval, false));
+        healthy.loading_since = Instant::now();
+        assert!(!healthy.due(interval, false));
+        assert!(healthy.due(interval, true));
+        healthy.poll_started = false;
+        assert!(healthy.due(interval, false));
+        // waiting on GPU readings holds back automatic polls, not manual ones
+        healthy.loading_since -= Duration::from_secs(31);
+        healthy.probing = Some(healthy.loading_since);
+        assert!(!healthy.due(interval, false));
+        assert!(healthy.due(interval, true));
+    }
+
+    #[test]
+    fn gpu_replies_update_only_their_cluster_and_preserve_job_states() {
+        let mut app = App::new(Config::default(), Vec::new());
+        for uid in 0..2 {
+            let mut c = test_cluster(uid);
+            c.probing = Some(c.loading_since);
+            c.jobs = Some(vec![job("42", "train", "RUNNING")]);
+            app.clusters.push(c);
+        }
+        let gpu = Gpu { name: "H200".into(), temp: 50, util: 90, mem_used: 100, mem_total: 200 };
+        let stale = app.clusters[1].loading_since - Duration::from_secs(1);
+        app.tx.send(Msg::Gpus(1, stale, Ok(HashMap::from([("42".into(), vec![gpu.clone()])])))).unwrap();
+        app.receive();
+        assert!(app.clusters[1].jobs.as_ref().unwrap()[0].gpus.is_empty(), "reply from an older poll is dropped");
+        let started = app.clusters[1].loading_since;
+        app.tx.send(Msg::Gpus(1, started, Ok(HashMap::from([("42".into(), vec![gpu])])))).unwrap();
+        app.receive();
+        assert!(app.clusters[0].probing.is_some());
+        assert!(app.clusters[0].jobs.as_ref().unwrap()[0].gpus.is_empty());
+        assert!(app.clusters[1].probing.is_none());
+        assert_eq!(app.clusters[1].jobs.as_ref().unwrap()[0].gpus[0].temp, 50);
+        assert_eq!(app.temp_history[&(1, "42".into())], [50]);
+        let started = app.clusters[0].loading_since;
+        app.tx.send(Msg::Gpus(0, started, Err("GPU timed out".into()))).unwrap();
+        app.receive();
+        assert!(app.clusters[0].probing.is_none());
+        assert!(app.clusters[0].error.is_none());
+        assert_eq!(app.clusters[0].gpu_error.as_deref(), Some("GPU timed out"));
+        assert!(app.clusters[0].jobs.as_ref().unwrap()[0].running());
+    }
+
+    #[test]
+    fn unchanged_log_keeps_contents_and_stale_replies_are_ignored() {
+        let mut app = App::new(Config::default(), Vec::new());
+        app.clusters.push(test_cluster(0));
+        app.log = Some(LogView {
+            ci: 0, id: "42".into(), name: "train".into(), stderr: true,
+            log: Some(Log { path: "/tmp/job.err".into(), size: 6,
+                lines: vec!["error".into()], fingerprint: "stamp".into() }),
+            error: Some("previous error".into()), loading: true, fetched: Instant::now(),
+            request: 2, final_refresh: false, top: Some(0),
+        });
+        app.tx.send(Msg::Log(1, Err("old stdout reply".into()))).unwrap();
+        app.receive();
+        assert!(app.log.as_ref().unwrap().loading);
+        app.tx.send(Msg::Log(2, Ok(None))).unwrap();
+        app.receive();
+        let view = app.log.as_ref().unwrap();
+        assert!(!view.loading);
+        assert!(view.error.is_none());
+        assert_eq!(view.log.as_ref().unwrap().lines, ["error"]);
+        assert_eq!(view.top, Some(0));
     }
 
     #[test]

@@ -63,8 +63,8 @@ live, `enter` keeps it and `esc` goes back. Make your own by adding a
 
 - `s` opens a shell **inside a running job**, on its GPU node.
 - `x` cancels a job (asks first). `/` filters by name, folder or id.
-- One shared ssh connection per cluster keeps refreshes quick. A cluster that stops
-  answering shows an error and retries, and never freezes the screen.
+- One shared ssh connection per cluster keeps refreshes quick. Each cluster refreshes
+  independently; a slow one never holds up the others. Job states appear before GPU readings.
 
 ## Install
 
@@ -177,11 +177,11 @@ The full list of keys is in [`themes/default.toml`](themes/default.toml).
 
 ## How it works
 
-Each refresh sends one small script to each cluster's login node over ssh:
+Each cluster refresh queries its login node over ssh:
 
 - `squeue` for active jobs, `sacct` for jobs that ended in the last 24 hours
-- `srun --jobid=<id> --overlap nvidia-smi` inside each running job, to read its GPUs (no new
-  resources used)
+- Then a separate script runs `srun --jobid=<id> --overlap nvidia-smi` inside each running
+  job to read its GPUs (no new resources used). Job states are displayed first.
 
 Notifications come from a tiny Swift app ([`notifier/main.swift`](notifier/main.swift)),
 because macOS shows the Script Editor icon on anything sent with `osascript`.

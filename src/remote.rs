@@ -71,7 +71,18 @@ sacct -X -n -P -S now-24hours \
 squeue -u "$USER" -h -O 'JobID:|,STDOUT:|,STDERR:' 2>/dev/null | sed 's/^/@@OUT|/' > "$t/out" &
 jobs=$(squeue -u "$USER" -h -o '@@JOB|%i|%j|%T|%M|%l|%b|%N|%S|%Z|%r|%P')
 printf '%s\n' "$jobs"
-for id in $(printf '%s\n' "$jobs" | awk -F'|' '$4=="RUNNING"{print $2}'); do
+wait
+cat "$t"/* 2>/dev/null
+rm -rf "$t"
+"#;
+
+/// GPU probes are separate from the job snapshot, so slow nodes don't delay job states.
+fn gpu_script(ids: &[String]) -> String {
+    let ids = ids.iter().map(|id| sh_quote(id)).collect::<Vec<_>>().join(" ");
+    format!(r#"
+t=$(mktemp -d)
+echo @@GPUS
+for id in {ids}; do
   timeout 10 srun --jobid="$id" --overlap -N1 -n1 \
     nvidia-smi --query-gpu=name,temperature.gpu,utilization.gpu,memory.used,memory.total \
     --format=csv,noheader,nounits </dev/null 2>/dev/null | sed "s/^/@@GPU|$id|/" > "$t/gpu.$id" &
@@ -79,7 +90,36 @@ done
 wait
 cat "$t"/* 2>/dev/null
 rm -rf "$t"
-"#;
+"#)
+}
+
+pub fn fetch_gpus(host: &str, ids: &[String]) -> Result<HashMap<String, Vec<Gpu>>, String> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let out = run(host, &gpu_script(ids))?;
+    Ok(parse_gpus(&out))
+}
+
+fn parse_gpus(out: &str) -> HashMap<String, Vec<Gpu>> {
+    let mut gpus: HashMap<String, Vec<Gpu>> = HashMap::new();
+    for line in out.lines() {
+        let Some(rest) = line.strip_prefix("@@GPU|") else { continue };
+        let Some((id, csv)) = rest.split_once('|') else { continue };
+        let p: Vec<&str> = csv.rsplitn(5, ',').map(str::trim).collect();
+        if p.len() == 5 {
+            let n = |s: &str| s.parse().unwrap_or(0);
+            gpus.entry(id.into()).or_default().push(Gpu {
+                name: short_gpu_name(p[4]),
+                temp: n(p[3]),
+                util: n(p[2]),
+                mem_used: n(p[1]),
+                mem_total: n(p[0]),
+            });
+        }
+    }
+    gpus
+}
 
 /// Time limits, so a hung connection shows an error instead of loading forever.
 const CHECK_LIMIT: Duration = Duration::from_secs(5);
@@ -191,11 +231,13 @@ fn parse_time(s: &str, tz: FixedOffset) -> Option<DateTime<Utc>> {
 }
 
 pub fn fetch_jobs(host: &str) -> Result<Snapshot, String> {
-    let out = run(host, JOBS_SCRIPT)?;
+    Ok(parse_jobs(&run(host, JOBS_SCRIPT)?))
+}
+
+fn parse_jobs(out: &str) -> Snapshot {
     let mut tz = FixedOffset::east_opt(0).unwrap();
     let mut active: Vec<Job> = Vec::new();
     let mut done: Vec<Job> = Vec::new();
-    let mut gpus: Vec<(String, Gpu)> = Vec::new();
     let mut outputs = HashMap::new();
 
     for line in out.lines().filter(|l| l.starts_with("@@")) {
@@ -245,29 +287,9 @@ pub fn fetch_jobs(host: &str) -> Result<Snapshot, String> {
             "@@OUT" if f.len() >= 4 => {
                 outputs.insert(f[1].trim().to_string(), (f[2].trim().to_string(), f[3].trim().to_string()));
             }
-            "@@GPU" if f.len() >= 3 => {
-                let csv = f[2..].join("|");
-                let p: Vec<&str> = csv.rsplitn(5, ',').map(str::trim).collect();
-                if p.len() == 5 {
-                    let n = |s: &str| s.parse().unwrap_or(0);
-                    gpus.push((f[1].into(), Gpu {
-                        name: short_gpu_name(p[4]),
-                        temp: n(p[3]),
-                        util: n(p[2]),
-                        mem_used: n(p[1]),
-                        mem_total: n(p[0]),
-                    }));
-                }
-            }
             _ => {}
         }
     }
-    for (id, g) in gpus {
-        if let Some(j) = active.iter_mut().find(|j| j.id == id) {
-            j.gpus.push(g);
-        }
-    }
-
     let rank = |s: &str| match s {
         "RUNNING" => 0,
         "CONFIGURING" => 1,
@@ -278,21 +300,36 @@ pub fn fetch_jobs(host: &str) -> Result<Snapshot, String> {
     done.retain(|d| !active.iter().any(|a| a.id == d.id));
     done.sort_by_key(|j| std::cmp::Reverse(j.end));
     active.extend(done);
-    Ok(Snapshot { jobs: active, outputs })
+    Snapshot { jobs: active, outputs }
 }
 
 pub struct Log {
     pub path: String,
     pub size: u64,
     pub lines: Vec<String>,
+    pub fingerprint: String,
 }
 
 /// Tail a job's stdout (or stderr). `pattern` is a fallback path pattern we saw earlier from squeue,
-/// used once Slurm has forgotten the job.
-pub fn fetch_log(host: &str, id: &str, name: &str, workdir: &str, pattern: &str, stderr: bool) -> Result<Log, String> {
-    let script = format!(
+/// used once Slurm has forgotten the job. `previous` caches the resolved path and file
+/// fingerprint; an unchanged file returns None. Omit it to force resolution and a full tail.
+pub fn fetch_log(
+    host: &str, id: &str, name: &str, workdir: &str, pattern: &str, stderr: bool,
+    previous: Option<&(String, String)>,
+) -> Result<Option<Log>, String> {
+    let script = log_script(id, name, workdir, pattern, stderr, previous);
+    parse_log(&run(host, &script)?)
+}
+
+fn log_script(
+    id: &str, name: &str, workdir: &str, pattern: &str, stderr: bool,
+    previous: Option<&(String, String)>,
+) -> String {
+    format!(
         r#"
 id={id}; name={name}; pat={pat}; key={key}; wd={wd}
+p={cached}
+if [ ! -r "$p" ]; then
 p=$(scontrol show job -o "$id" 2>/dev/null | tr ' ' '\n' | sed -n "s/^$key=//p")
 case "$p" in ""|"(null)") p=$(sacct -j "$id" -X -n -P -o "$key" 2>/dev/null | head -1);; esac
 case "$p" in ""|"(null)") p="$pat";; esac
@@ -303,29 +340,48 @@ if [ -z "$p" ] && [ -d "$wd" ]; then
   p=$(find "$wd" -maxdepth 3 -type f -name "*$A*" \( -name '*.out' -o -name '*.log' -o -name '*.err' -o -name '*.txt' \) 2>/dev/null \
       | grep -E "$([ $key = StdErr ] && echo 'err' || echo 'out|log|txt')" | head -1)
 fi
+fi
 echo "@@PATH|$p"
 if [ -z "$p" ]; then echo "@@ERR|Slurm no longer knows where this job's log is"
 elif [ ! -r "$p" ]; then echo "@@ERR|can't read $p"
-else echo "@@SIZE|$(stat -c %s "$p")"; tail -n 3000 "$p"; fi
+else
+  stamp=$(stat -Lc '%d:%i:%s:%y:%z' -- "$p") || exit 1
+  if [ "$stamp" = {stamp} ]; then
+    echo @@UNCHANGED
+  else
+    echo "@@STAMP|$stamp"
+    echo "@@SIZE|$(stat -Lc %s -- "$p")"
+    tail -n 3000 -- "$p"
+  fi
+fi
 "#,
         id = sh_quote(id),
         name = sh_quote(name),
         pat = sh_quote(pattern),
         key = if stderr { "StdErr" } else { "StdOut" },
         wd = sh_quote(workdir),
-    );
-    let out = run(host, &script)?;
+        cached = sh_quote(previous.map_or("", |p| p.0.as_str())),
+        stamp = sh_quote(previous.map_or("", |p| p.1.as_str())),
+    )
+}
+
+fn parse_log(out: &str) -> Result<Option<Log>, String> {
     let mut path = String::new();
+    let mut fingerprint = String::new();
     let mut lines = out.lines();
     for line in lines.by_ref() {
         if let Some(p) = line.strip_prefix("@@PATH|") {
             path = p.to_string();
         } else if let Some(e) = line.strip_prefix("@@ERR|") {
             return Err(e.to_string());
+        } else if line == "@@UNCHANGED" {
+            return Ok(None);
+        } else if let Some(s) = line.strip_prefix("@@STAMP|") {
+            fingerprint = s.into();
         } else if let Some(s) = line.strip_prefix("@@SIZE|") {
             let size = s.trim().parse().unwrap_or(0);
             let lines = lines.map(clean_log_line).collect();
-            return Ok(Log { path, size, lines });
+            return Ok(Some(Log { path, size, lines, fingerprint }));
         }
     }
     Err("no log output".into())
@@ -369,4 +425,100 @@ pub fn copy_to_clipboard(text: &str) -> bool {
     let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() else { return false };
     let ok = child.stdin.take().is_some_and(|mut s| s.write_all(text.as_bytes()).is_ok());
     child.wait().is_ok_and(|s| s.success()) && ok
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bash(script: &str) -> String {
+        let out = Command::new("bash").args(["-c", script]).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    #[test]
+    fn job_collection_does_not_probe_gpus() {
+        let out = bash(&format!(r#"
+squeue() {{
+  case "$*" in
+    *STDOUT*) echo '42|/tmp/job.out|/tmp/job.err';;
+    *) echo '@@JOB|42|train|RUNNING|1:00|1:00:00|gpu:1|node1|2026-10-30T12:00:00|/tmp|None|gpu';;
+  esac
+}}
+sacct() {{ echo '41|old|COMPLETED|1:00|1:00:00|2026-10-30T11:00:00|0:0|/tmp|gres/gpu=1|node1|gpu'; }}
+timeout() {{ shift; "$@"; }}
+srun() {{ echo UNEXPECTED_GPU_PROBE; }}
+{JOBS_SCRIPT}
+"#));
+        assert!(!out.contains("UNEXPECTED_GPU_PROBE"));
+        let snap = parse_jobs(&out);
+        assert_eq!(snap.jobs.len(), 2);
+        assert!(snap.jobs[0].running());
+        assert!(snap.jobs[1].finished());
+        assert!(snap.jobs.iter().all(|j| j.gpus.is_empty()));
+        assert_eq!(snap.outputs["42"].0, "/tmp/job.out");
+    }
+
+    #[test]
+    fn gpu_script_keeps_multiple_jobs_and_gpus_separate() {
+        let script = gpu_script(&["42".into(), "43_1".into(), "44".into()]);
+        let out = bash(&format!(r#"
+timeout() {{ shift; "$@"; }}
+srun() {{
+  case "$1" in
+    --jobid=42) printf 'NVIDIA H200, 50, 90, 100, 200\nNVIDIA H200, 51, 91, 101, 200\n';;
+    --jobid=43_1) echo 'NVIDIA A100, 60, 80, 150, 200';;
+    *) return 1;;
+  esac
+}}
+{script}
+"#));
+        let gpus = parse_gpus(&out);
+        assert_eq!(gpus["42"].len(), 2);
+        assert_eq!(gpus["42"][1].temp, 51);
+        assert_eq!(gpus["43_1"][0].util, 80);
+        assert!(!gpus.contains_key("44"));
+    }
+
+    #[test]
+    fn cached_logs_skip_resolution_and_download_but_detect_changes() {
+        let dir = std::env::temp_dir().join(format!("gpudash-log-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("job's output.log");
+        let path = path.to_str().unwrap();
+        let calls = dir.join("calls");
+        let read = |previous: Option<&(String, String)>, stamp: &str, size: u64| {
+            std::fs::write(&calls, "").unwrap();
+            let script = log_script("42", "train", "", path, false, previous);
+            let out = bash(&format!(r#"
+scontrol() {{ echo resolve >> {calls}; }}
+sacct() {{ :; }}
+tail() {{ echo tail >> {calls}; command tail "$@"; }}
+# Supply metadata independently of filesystem clock resolution.
+stat() {{ case "$*" in *%d*) printf '%s\n' {stamp};; *) echo {size};; esac; }}
+{script}
+"#, calls = sh_quote(calls.to_str().unwrap()), stamp = sh_quote(stamp)));
+            parse_log(&out).unwrap()
+        };
+        std::fs::write(path, "first\n").unwrap();
+        let first = read(None, "inode1:size6:time1", 6).unwrap();
+        assert_eq!(first.lines, ["first"]);
+        assert_eq!(std::fs::read_to_string(&calls).unwrap(), "resolve\ntail\n");
+        let previous = (first.path, first.fingerprint);
+        assert!(read(Some(&previous), "inode1:size6:time1", 6).is_none());
+        assert_eq!(std::fs::read_to_string(&calls).unwrap(), "");
+        std::fs::write(path, "other\n").unwrap();
+        assert_eq!(read(Some(&previous), "inode1:size6:time2", 6).unwrap().lines, ["other"]);
+        std::fs::write(path, "").unwrap();
+        assert!(read(Some(&previous), "inode1:size0:time3", 0).unwrap().lines.is_empty());
+        std::fs::remove_file(path).unwrap();
+        std::fs::write(path, "new\n").unwrap();
+        assert_eq!(read(Some(&previous), "inode2:size4:time4", 4).unwrap().lines, ["new"]);
+        let missing = (dir.join("missing.log").display().to_string(), previous.1);
+        assert_eq!(read(Some(&missing), "inode2:size4:time4", 4).unwrap().path, path);
+        assert!(read(None, "inode2:size4:time4", 4).is_some());
+        assert_eq!(std::fs::read_to_string(&calls).unwrap(), "resolve\ntail\n");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
