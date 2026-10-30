@@ -42,7 +42,8 @@ job gets big usage and memory bars and a temperature graph.
 ![a colored job log](assets/screenshots/log.png)
 
 `enter` opens the job's log: colored, scrollable, and following the end while the job runs.
-It finds logs even after Slurm has forgotten the job.
+It finds logs even after Slurm has forgotten the job. Unchanged logs stay on screen without
+being downloaded again; `r` forces a fresh read.
 
 ### Command palette
 
@@ -63,8 +64,8 @@ live, `enter` keeps it and `esc` goes back. Make your own by adding a
 
 - `s` opens a shell **inside a running job**, on its GPU node.
 - `x` cancels a job (asks first). `/` filters by name, folder or id.
-- One shared ssh connection per cluster keeps refreshes quick. A cluster that stops
-  answering shows an error and retries, and never freezes the screen.
+- One shared ssh connection per cluster keeps refreshes quick. Each cluster refreshes on
+  its own timer, so one that stops answering shows an error and retries without holding up the rest.
 
 ## Install
 
@@ -177,11 +178,11 @@ The full list of keys is in [`themes/default.toml`](themes/default.toml).
 
 ## How it works
 
-Each refresh sends one small script to each cluster's login node over ssh:
+Each refresh sends small scripts to each cluster's login node over ssh:
 
 - `squeue` for active jobs, `sacct` for jobs that ended in the last 24 hours
-- `srun --jobid=<id> --overlap nvidia-smi` inside each running job, to read its GPUs (no new
-  resources used)
+- then, in a second script, `srun --jobid=<id> --overlap nvidia-smi` inside each running job,
+  to read its GPUs (no new resources used). Job states show up before the GPU readings.
 
 Notifications come from a tiny Swift app ([`notifier/main.swift`](notifier/main.swift)),
 because macOS shows the Script Editor icon on anything sent with `osascript`.
