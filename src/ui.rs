@@ -114,7 +114,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     } else if app.paused {
         right.push(Span::styled("‖ paused ", Style::new().fg(t().queued)));
     } else {
-        let left = app.interval().saturating_sub(app.last_refresh.elapsed()).as_secs();
+        let left = app.next_refresh().as_secs();
         let left = if left >= 60 { format!("{}m{:02}s", left / 60, left % 60) } else { format!("{left}s") };
         right.push(dim(format!("↻ {left} ")));
     }

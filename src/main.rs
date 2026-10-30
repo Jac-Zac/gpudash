@@ -198,8 +198,8 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
             // about every 8s: tell the background daemon the dashboard is open
             background::heartbeat();
         }
-        if !app.paused && !app.loading() && app.last_refresh.elapsed() >= app.interval() {
-            app.refresh();
+        if !app.paused {
+            app.auto_refresh();
         }
         app.tick += 1;
     }
