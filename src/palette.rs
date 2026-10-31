@@ -40,6 +40,7 @@ pub enum Cmd {
     OpenLog,
     Shell,
     Cancel,
+    PodAction(crate::runpod::Action),
     CopyId,
     CopyFolder,
     // view
@@ -117,15 +118,29 @@ pub fn items(app: &App, menu: Menu) -> Vec<Item> {
     match menu {
         Menu::Root => {
             let mut v = Vec::new();
-            if let Some((_, _, j)) = app.selected_job() {
+            if let Some((_, cluster, j)) = app.selected_job() {
+                let slurm = !cluster.source.is_runpod();
                 let running = j.running();
-                v.push(item("job", "Open log", "enter", Run(Cmd::OpenLog)));
-                v.push(item("job", if running { "Shell into job's node" } else { "Shell in job's folder" }, "s", Run(Cmd::Shell)));
-                if !j.finished() {
-                    v.push(item("job", format!("Cancel {}", j.name), "x", Run(Cmd::Cancel)));
+                if slurm {
+                    v.push(item("job", "Open log", "enter", Run(Cmd::OpenLog)));
+                    v.push(item("job", if running { "Shell into job's node" } else { "Shell in job's folder" }, "s", Run(Cmd::Shell)));
+                    if !j.finished() {
+                        v.push(item("job", format!("Cancel {}", j.name), "x", Run(Cmd::Cancel)));
+                    }
+                } else {
+                    if j.pod_ssh().is_some() {
+                        v.push(item("pod", "SSH into pod", "enter/s", Run(Cmd::Shell)));
+                    }
+                    use crate::runpod::Action::*;
+                    for action in [Start, Stop, Restart, Terminate] {
+                        if j.pod.as_ref().is_some_and(|p| p.allows(action, &j.state)) {
+                            let shortcut = if matches!(action, Stop | Terminate) { "x" } else { "R" };
+                            v.push(item("pod", format!("{} {}", action.title(), j.name), shortcut, Run(Cmd::PodAction(action))));
+                        }
+                    }
                 }
-                v.push(item("job", "Copy job id", "y", Run(Cmd::CopyId)));
-                v.push(item("job", "Copy folder path", "", Run(Cmd::CopyFolder)));
+                v.push(item("job", if slurm { "Copy job id" } else { "Copy pod id" }, "y", Run(Cmd::CopyId)));
+                if slurm { v.push(item("job", "Copy folder path", "", Run(Cmd::CopyFolder))); }
             }
             v.extend([
                 item("view", "Refresh now", "r", Run(Cmd::Refresh)),
@@ -201,15 +216,15 @@ pub fn items(app: &App, menu: Menu) -> Vec<Item> {
             .clusters
             .iter()
             .enumerate()
-            .map(|(i, cl)| item("", cl.host.clone(), "", Run(Cmd::RemoveCluster(i))))
+            .map(|(i, cl)| item("", cl.host().to_string(), "", Run(Cmd::RemoveCluster(i))))
             .collect(),
         Menu::PrefixCluster => app
             .clusters
             .iter()
             .enumerate()
             .map(|(i, cl)| {
-                let hint = if cl.prefix.is_empty() { "none".to_string() } else { cl.prefix.clone() };
-                item("", cl.host.clone(), hint, Run(Cmd::SetPrefix(i)))
+                let hint = if cl.source.prefix.is_empty() { "none".to_string() } else { cl.source.prefix.clone() };
+                item("", cl.host().to_string(), hint, Run(Cmd::SetPrefix(i)))
             })
             .collect(),
     }

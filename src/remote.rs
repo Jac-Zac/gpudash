@@ -39,9 +39,17 @@ pub struct Job {
     pub partition: String,
     pub exit: String,
     pub gpus: Vec<Gpu>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod: Option<crate::runpod::PodDetails>,
 }
 
 impl Job {
+    pub fn pod_ssh(&self) -> Option<&crate::runpod::SshEndpoint> {
+        if !self.running() { return None; }
+        let ssh = self.pod.as_ref()?.ssh.as_ref()?;
+        ssh.proxy.as_ref().or(ssh.direct.as_ref())
+    }
+
     pub fn running(&self) -> bool {
         self.state == "RUNNING"
     }
@@ -58,6 +66,14 @@ pub struct Snapshot {
     pub jobs: Vec<Job>,
     /// job id -> (stdout pattern, stderr pattern), as squeue reports them
     pub outputs: HashMap<String, (String, String)>,
+}
+
+/// Fetch a snapshot from whichever provider the cluster uses.
+pub fn fetch(source: &crate::config::ClusterConf) -> Result<Snapshot, String> {
+    match source.provider {
+        crate::config::Provider::Slurm => fetch_jobs(&source.host),
+        crate::config::Provider::Runpod => crate::runpod::fetch(),
+    }
 }
 
 // Every line we read starts with @@, so login banners are ignored.
@@ -226,6 +242,7 @@ pub fn fetch_jobs(host: &str) -> Result<Snapshot, String> {
                 partition: f[11].into(),
                 exit: String::new(),
                 gpus: Vec::new(),
+                pod: None,
             }),
             "@@DONE" if f.len() >= 12 => {
                 // 'CANCELLED by 1234' -> 'CANCELLED'
@@ -249,6 +266,7 @@ pub fn fetch_jobs(host: &str) -> Result<Snapshot, String> {
                     partition: f[11].into(),
                     exit: f[7].into(),
                     gpus: Vec::new(),
+                    pod: None,
                 });
             }
             "@@OUT" if f.len() >= 4 => {

@@ -18,10 +18,9 @@ const HISTORY_LEN: usize = 120;
 const LOG_REFRESH: Duration = Duration::from_secs(3);
 
 pub struct Cluster {
+    pub source: ClusterConf,
     /// stable id, so results from a fetch still land right after clusters are added or removed
     pub uid: usize,
-    pub host: String,
-    pub prefix: String,
     pub jobs: Option<Vec<Job>>,
     pub fetched: Option<Instant>,
     pub error: Option<String>,
@@ -32,6 +31,10 @@ pub struct Cluster {
 }
 
 impl Cluster {
+    pub fn host(&self) -> &str {
+        self.source.label()
+    }
+
     fn due(&self, interval: Duration) -> bool {
         !self.loading && self.loading_since.elapsed() >= interval
     }
@@ -54,6 +57,7 @@ pub struct LogView {
 
 pub enum Popup {
     Help,
+    ConfirmPod { id: String, name: String, action: crate::runpod::Action },
     ConfirmCancel { ci: usize, id: String, name: String },
 }
 
@@ -62,6 +66,7 @@ pub enum Next {
     Continue,
     Quit,
     Shell { host: String, workdir: String, running_id: Option<String> },
+    PodShell(crate::runpod::SshEndpoint),
     EditConfig,
 }
 
@@ -70,6 +75,7 @@ pub enum Msg {
     Gpus(usize, Result<HashMap<String, Vec<Gpu>>, String>), // (cluster uid, job id -> GPUs)
     Log(String, bool, Result<Option<Log>, String>),
     Cancelled(String, Result<(), String>),
+    PodAction(String, crate::runpod::Action, Result<(), String>),
 }
 
 pub struct App {
@@ -81,6 +87,7 @@ pub struct App {
     /// clusters came from the command line, so cluster edits aren't saved
     cli_clusters: bool,
     next_uid: usize,
+    pod_busy: bool,
     pub paused: bool,
     /// show only this cluster (index); None shows them all
     pub focus: Option<usize>,
@@ -110,8 +117,8 @@ impl App {
             cli_hosts
                 .into_iter()
                 .map(|host| {
-                    let prefix = config.clusters.iter().find(|c| c.host == host).map(|c| c.prefix.clone());
-                    ClusterConf { host, prefix: prefix.unwrap_or_default() }
+                    config.clusters.iter().find(|c| c.label() == host).cloned()
+                        .unwrap_or(ClusterConf { host, ..ClusterConf::default() })
                 })
                 .collect()
         } else {
@@ -125,6 +132,7 @@ impl App {
             config,
             cli_clusters,
             next_uid: 0,
+            pod_busy: false,
             paused: false,
             focus: None,
             last_wheel: None,
@@ -150,9 +158,8 @@ impl App {
     fn push_cluster(&mut self, c: ClusterConf) {
         self.clusters.push(Cluster {
             uid: self.next_uid,
-            outputs: load_outputs(&c.host),
-            host: c.host,
-            prefix: c.prefix,
+            outputs: load_outputs(c.label()),
+            source: c,
             jobs: None,
             fetched: None,
             error: None,
@@ -189,7 +196,7 @@ impl App {
         self.config.clusters = self
             .clusters
             .iter()
-            .map(|c| ClusterConf { host: c.host.clone(), prefix: c.prefix.clone() })
+            .map(|c| c.source.clone())
             .collect();
     }
 
@@ -203,10 +210,10 @@ impl App {
         if !self.cli_clusters {
             let mut old: Vec<Cluster> = std::mem::take(&mut self.clusters);
             for conf in &config.clusters {
-                match old.iter().position(|c| c.host == conf.host) {
+                match old.iter().position(|c| c.host() == conf.label() && c.source.provider == conf.provider) {
                     Some(i) => {
                         let mut c = old.remove(i);
-                        c.prefix = conf.prefix.clone();
+                        c.source = conf.clone();
                         self.clusters.push(c);
                     }
                     None => {
@@ -261,16 +268,16 @@ impl App {
             }
             c.loading = true;
             c.loading_since = Instant::now();
-            let (tx, host, uid) = (self.tx.clone(), c.host.clone(), c.uid);
-            // Job states first, then GPU readings. A successful Jobs message is always followed
-            // by a Gpus message, and the cluster stays loading until it arrives.
+            let (tx, source, uid) = (self.tx.clone(), c.source.clone(), c.uid);
+            // Job states first, then GPU readings. A successful Slurm Jobs message is always followed
+            // by a Gpus message, and the cluster stays loading until it arrives; Runpod sends only Jobs.
             thread::spawn(move || {
-                let jobs = remote::fetch_jobs(&host);
+                let jobs = remote::fetch(&source);
                 let running: Option<Vec<String>> = jobs.as_ref().ok()
                     .map(|s| s.jobs.iter().filter(|j| j.running()).map(|j| j.id.clone()).collect());
                 let _ = tx.send(Msg::Jobs(uid, jobs));
-                if let Some(ids) = running {
-                    let _ = tx.send(Msg::Gpus(uid, remote::fetch_gpus(&host, &ids)));
+                if !source.is_runpod() && let Some(ids) = running {
+                    let _ = tx.send(Msg::Gpus(uid, remote::fetch_gpus(&source.host, &ids)));
                 }
             });
         }
@@ -313,6 +320,14 @@ impl App {
                         }
                     }
                 }
+                Msg::PodAction(id, action, result) => {
+                    self.pod_busy = false;
+                    match result {
+                        Ok(()) => self.say(format!("{} requested for {id}; refreshing…", action.verb()), false),
+                        Err(e) => self.say(format!("couldn't {} {id}: {e}", action.verb()), true),
+                    }
+                    self.refresh();
+                }
                 Msg::Cancelled(id, result) => {
                     match result {
                         Ok(()) => self.say(format!("cancelled {id}"), false),
@@ -337,28 +352,32 @@ impl App {
             }
         };
         // compare against the last snapshot, whether this dashboard or the background daemon took it
-        let previous = crate::background::load_seen(&c.host)
+        let previous = crate::background::load_seen(c.host())
             .map(|(when, jobs)| (Some(when), jobs))
             .or_else(|| c.jobs.clone().map(|jobs| (None, jobs)));
         if self.config.notifications {
             if let Some((since, old)) = &previous {
-                for (title, body) in job_changes(&c.host, old, &snap.jobs, *since, &self.config) {
+                let notes = if c.source.is_runpod() {
+                    crate::runpod::changes(c.host(), old, &snap.jobs, &self.config)
+                } else { job_changes(c.host(), old, &snap.jobs, *since, &self.config) };
+                for (title, body) in notes {
                     notifier::notify(&title, &body, self.config.notify_sound);
                 }
             }
         }
-        crate::background::save_seen(&c.host, &snap.jobs);
+        crate::background::save_seen(c.host(), &snap.jobs);
         let before = c.outputs.len();
         c.outputs.extend(snap.outputs);
         if c.outputs.len() != before {
-            save_outputs(&c.host, &c.outputs);
+            save_outputs(c.host(), &c.outputs);
         }
         // keep the last GPU readings on screen until the new ones arrive
-        for j in snap.jobs.iter_mut().filter(|j| j.running()) {
+        for j in snap.jobs.iter_mut().filter(|j| j.running() && j.pod.is_none()) {
             if let Some(old) = c.jobs.iter().flatten().find(|old| old.id == j.id) {
                 j.gpus = old.gpus.clone();
             }
         }
+        if c.source.is_runpod() { c.loading = false; }
         c.jobs = Some(snap.jobs);
         c.fetched = Some(Instant::now());
         c.error = None;
@@ -473,7 +492,11 @@ impl App {
     // ---------- actions ----------
 
     pub fn open_log(&mut self) {
-        let Some((ci, _, j)) = self.selected_job() else { return };
+        let Some((ci, c, j)) = self.selected_job() else { return };
+        if c.source.is_runpod() {
+            self.say("pods have no log here; press enter or s to SSH in", false);
+            return;
+        }
         self.log = Some(LogView {
             ci,
             id: j.id.clone(),
@@ -515,7 +538,7 @@ impl App {
         let job = c.jobs.iter().flatten().find(|j| j.id == v.id);
         v.fetched_running = job.is_some_and(|j| j.running());
         let workdir = job.map_or(String::new(), |j| j.workdir.clone());
-        let (tx, host, id, name, stderr) = (self.tx.clone(), c.host.clone(), v.id.clone(), v.name.clone(), v.stderr);
+        let (tx, host, id, name, stderr) = (self.tx.clone(), c.host().to_string(), v.id.clone(), v.name.clone(), v.stderr);
         let known = v.log.as_ref().filter(|_| skip_unchanged && v.fetched_running)
             .map(|log| (log.path.clone(), log.stamp.clone()));
         thread::spawn(move || {
@@ -542,7 +565,14 @@ impl App {
     }
 
     pub fn ask_cancel(&mut self) {
-        let Some((ci, _, j)) = self.selected_job() else { return };
+        let Some((ci, c, j)) = self.selected_job() else { return };
+        if c.source.is_runpod() {
+            match j.pod.as_ref().and_then(|p| p.x_action(&j.state)) {
+                Some(action) => self.ask_pod_action(action),
+                None => self.say("can't stop or delete this pod in its current state; refresh with r", true),
+            }
+            return;
+        }
         if j.finished() {
             self.say("that job already ended", true);
             return;
@@ -550,8 +580,42 @@ impl App {
         self.popup = Some(Popup::ConfirmCancel { ci, id: j.id.clone(), name: j.name.clone() });
     }
 
+    pub fn ask_restart_pod(&mut self) {
+        let Some((_, c, j)) = self.selected_job() else { return };
+        if !c.source.is_runpod() { return; }
+        match j.pod.as_ref().and_then(|p| p.restart_action(&j.state)) {
+            Some(action) => self.ask_pod_action(action),
+            None => self.say("can't start or restart this pod in its current state; refresh with r", true),
+        }
+    }
+
+    pub fn ask_pod_action(&mut self, action: crate::runpod::Action) {
+        if self.pod_busy {
+            self.say("a pod action is still in progress", false);
+            return;
+        }
+        let Some((_, c, j)) = self.selected_job() else { return };
+        if !c.source.is_runpod() { return; }
+        if !j.pod.as_ref().is_some_and(|p| p.allows(action, &j.state)) {
+            self.say("that action is unavailable in the pod's current state; refresh with r", true);
+            return;
+        }
+        self.popup = Some(Popup::ConfirmPod { id: j.id.clone(), name: j.name.clone(), action });
+    }
+
+    pub fn pod_action(&mut self, id: String, action: crate::runpod::Action) {
+        if self.pod_busy { return; }
+        self.pod_busy = true;
+        self.say(format!("requesting {} for {id}…", action.verb()), false);
+        let tx = self.tx.clone();
+        thread::spawn(move || {
+            let result = crate::runpod::act(&id, action);
+            let _ = tx.send(Msg::PodAction(id, action, result));
+        });
+    }
+
     pub fn cancel(&mut self, ci: usize, id: String) {
-        let (tx, host) = (self.tx.clone(), self.clusters[ci].host.clone());
+        let (tx, host) = (self.tx.clone(), self.clusters[ci].host().to_string());
         self.say(format!("cancelling {id}…"), false);
         thread::spawn(move || {
             let r = remote::cancel(&host, &id);
@@ -578,10 +642,20 @@ impl App {
         self.save(msg);
     }
 
-    pub fn shell_target(&self) -> Next {
+    pub fn shell_target(&mut self) -> Next {
         match self.selected_job() {
+            Some((_, c, j)) if c.source.is_runpod() => {
+                if let Some(endpoint) = j.pod_ssh() {
+                    return Next::PodShell(endpoint.clone());
+                }
+                let message = if j.running() {
+                    "SSH details unavailable; refresh or check that SSH is enabled for this pod"
+                } else { "SSH requires a running pod" };
+                self.say(message, false);
+                Next::Continue
+            }
             Some((_, c, j)) => Next::Shell {
-                host: c.host.clone(),
+                host: c.host().to_string(),
                 workdir: j.workdir.clone(),
                 running_id: j.running().then(|| j.id.clone()),
             },
@@ -596,6 +670,7 @@ impl App {
             Cmd::OpenLog => self.open_log(),
             Cmd::Shell => return self.shell_target(),
             Cmd::Cancel => self.ask_cancel(),
+            Cmd::PodAction(action) => self.ask_pod_action(action),
             Cmd::CopyId => self.copy_id(),
             Cmd::CopyFolder => {
                 if let Some((_, _, j)) = self.selected_job() {
@@ -713,7 +788,7 @@ impl App {
             }
             Cmd::RemoveCluster(i) => {
                 if i < self.clusters.len() {
-                    let host = self.clusters.remove(i).host;
+                    let host = self.clusters.remove(i).host().to_string();
                     self.forget_positions();
                     self.sync_cluster_config();
                     self.save(format!("removed {host}"));
@@ -722,15 +797,15 @@ impl App {
             Cmd::SetPrefix(i) => {
                 if let Some(cl) = self.clusters.get(i) {
                     self.palette = Some(Palette::with_prompt(Prompt {
-                        title: format!("Folder prefix for {}", cl.host),
+                        title: format!("Folder prefix for {}", cl.host()),
                         help: "hidden from the folder column · leave empty for none".into(),
-                        text: cl.prefix.clone(),
+                        text: cl.source.prefix.clone(),
                         kind: PromptKind::Prefix(i),
                     }));
                 }
             }
             Cmd::Reconnect => {
-                let hosts: Vec<String> = self.clusters.iter().map(|c| c.host.clone()).collect();
+                let hosts: Vec<String> = self.clusters.iter().filter(|c| !c.source.is_runpod()).map(|c| c.host().to_string()).collect();
                 for h in &hosts {
                     remote::disconnect(h);
                 }
@@ -756,7 +831,7 @@ impl App {
                 if text.is_empty() {
                     return;
                 }
-                if self.clusters.iter().any(|c| c.host == text) {
+                if self.clusters.iter().any(|c| c.host() == text) {
                     self.say(format!("{text} is already there"), true);
                     return;
                 }
@@ -768,15 +843,15 @@ impl App {
                 }));
             }
             PromptKind::AddPrefix(host) => {
-                self.push_cluster(ClusterConf { host: host.clone(), prefix: text });
+                self.push_cluster(ClusterConf { host: host.clone(), prefix: text, ..ClusterConf::default() });
                 self.sync_cluster_config();
                 self.save(format!("added {host}"));
                 self.refresh();
             }
             PromptKind::Prefix(i) => {
                 if let Some(cl) = self.clusters.get_mut(i) {
-                    cl.prefix = text;
-                    let host = cl.host.clone();
+                    cl.source.prefix = text;
+                    let host = cl.host().to_string();
                     self.sync_cluster_config();
                     self.save(format!("updated prefix for {host}"));
                 }
@@ -929,12 +1004,13 @@ mod tests {
             partition: String::new(),
             exit: String::new(),
             gpus: Vec::new(),
+            pod: None,
         }
     }
 
     fn test_cluster(uid: usize) -> Cluster {
         Cluster {
-            uid, host: "test".into(), prefix: String::new(), jobs: None, fetched: None,
+            source: ClusterConf { host: "test".into(), ..ClusterConf::default() }, uid, jobs: None, fetched: None,
             error: None, loading: false, loading_since: Instant::now(), outputs: HashMap::new(),
         }
     }
@@ -1062,6 +1138,152 @@ mod tests {
         assert_eq!(due, [false, true, false], "a slow cluster doesn't block the others");
     }
 
+    fn press(app: &mut App, code: ratatui::crossterm::event::KeyCode) -> Next {
+        crate::on_key(app, ratatui::crossterm::event::KeyEvent::new(code, ratatui::crossterm::event::KeyModifiers::NONE))
+    }
+
+    /// Everything on a 160×32 screen, and its bottom (footer) row.
+    fn screen(app: &App) -> String {
+        render(app, 160, 32).0.backend().buffer().content.iter().map(|c| c.symbol()).collect()
+    }
+
+    fn footer(app: &App) -> String {
+        let (terminal, _) = render(app, 160, 32);
+        (0..160).map(|x| terminal.backend().buffer()[(x, 31)].symbol()).collect()
+    }
+
+    /// One Runpod cluster holding the fixture pods.
+    fn pod_app() -> App {
+        let source = ClusterConf { provider: config::Provider::Runpod, ..ClusterConf::default() };
+        let mut app = App::new(Config { clusters: vec![source], ..Config::default() }, vec![]);
+        app.clusters[0].jobs = Some(crate::runpod::tests::fixture().jobs);
+        app
+    }
+
+    #[test]
+    fn runpod_rows_render_and_offer_only_supported_actions() {
+        let mut app = pod_app();
+        app.select(0, "running".into());
+        let source = app.clusters[0].source.clone();
+        app.sync_cluster_config();
+        assert_eq!(app.config.clusters[0], source);
+        let screen = screen(&app);
+        assert!(screen.contains("compute rate"));
+        assert!(screen.contains("$1.200/h"));
+        assert!(screen.contains("CPU 12%"));
+        assert!(screen.contains("0% / —"));
+        assert!(screen.contains("2 GPUs in use"));
+        assert!(screen.contains("0 queued"), "stopped Pods are not queued jobs");
+        assert!(screen.contains("✓ running"));
+        assert!(screen.contains("‖ stopped"));
+        assert!(!screen.contains('∞'), "unknown pod uptime is unavailable, not infinite");
+        let footer = footer(&app);
+        assert!(!footer.contains(" log ") && !footer.contains(" shell ") && !footer.contains(" cancel "));
+        let items = crate::palette::items(&app, crate::palette::Menu::Root);
+        assert!(!items.iter().any(|i| matches!(i.act, crate::palette::Act::Run(Cmd::Cancel | Cmd::Shell | Cmd::OpenLog))));
+        app.open_log();
+        app.ask_cancel();
+        assert!(app.log.is_none());
+        assert!(matches!(app.popup, Some(Popup::ConfirmPod { action: crate::runpod::Action::Stop, .. })));
+        assert!(matches!(app.shell_target(), Next::Continue));
+    }
+
+    #[test]
+    fn pod_actions_follow_api_capabilities_and_require_confirmation() {
+        use crate::runpod::Action;
+        use ratatui::crossterm::event::KeyCode;
+        let mut app = pod_app();
+        for (id, expected) in [("running", vec![Action::Stop, Action::Restart]), ("stopped", vec![Action::Start, Action::Terminate]), ("starting", vec![Action::Stop])] {
+            app.select(0, id.into());
+            let actions: Vec<_> = crate::palette::items(&app, crate::palette::Menu::Root).into_iter().filter_map(|i| {
+                if let crate::palette::Act::Run(Cmd::PodAction(a)) = i.act { Some(a) } else { None }
+            }).collect();
+            assert_eq!(actions, expected);
+            for action in actions {
+                app.run(Cmd::PodAction(action));
+                assert!(matches!(&app.popup, Some(Popup::ConfirmPod { id: target, action: a, .. }) if target == id && *a == action));
+                assert!(screen(&app).contains(action.warning()));
+                press(&mut app, KeyCode::Esc);
+                assert!(app.popup.is_none());
+                assert!(!app.pod_busy);
+                assert!(app.rx.try_recv().is_err());
+            }
+        }
+        for (id, action) in [("running", Action::Restart), ("stopped", Action::Start)] {
+            app.select(0, id.into());
+            press(&mut app, KeyCode::Char('R'));
+            assert!(matches!(&app.popup, Some(Popup::ConfirmPod { action: a, .. }) if *a == action));
+            app.popup = None;
+            assert!(footer(&app).contains(&format!("R {}", action.verb())));
+        }
+        app.select(0, "running".into());
+        press(&mut app, KeyCode::Char('x'));
+        assert!(matches!(app.popup, Some(Popup::ConfirmPod { action: Action::Stop, .. })));
+        app.popup = None;
+        app.select(0, "stopped".into());
+        press(&mut app, KeyCode::Char('x'));
+        assert!(matches!(&app.popup, Some(Popup::ConfirmPod { id, action: Action::Terminate, .. }) if id == "stopped"));
+        let screen = screen(&app);
+        assert!(screen.contains("Permanently deletes this pod"));
+        assert!(screen.contains("Network volumes are kept"));
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.popup.is_none(), "pressing x again must cancel, not delete");
+        assert!(!app.pod_busy);
+        assert!(footer(&app).contains("x delete"));
+        app.select(0, "running".into());
+        app.ask_pod_action(Action::Terminate);
+        assert!(app.popup.is_none());
+        app.select(0, "starting".into());
+        app.ask_restart_pod();
+        assert!(app.popup.is_none());
+        app.select(0, "stopped".into());
+        app.ask_pod_action(Action::Restart);
+        assert!(app.popup.is_none());
+        app.pod_busy = true;
+        app.ask_pod_action(Action::Start);
+        assert!(app.popup.is_none());
+    }
+
+    #[test]
+    fn running_pods_offer_ssh_with_direct_and_proxy_targets() {
+        use ratatui::crossterm::event::KeyCode;
+        let mut app = pod_app();
+        fn running(app: &mut App) -> &mut Job {
+            app.clusters[0].jobs.as_mut().unwrap().iter_mut().find(|j| j.id == "running").unwrap()
+        }
+        running(&mut app).pod.as_mut().unwrap().ssh = Some(serde_json::from_value(serde_json::json!({
+            "direct": {"host": "192.0.2.1", "port": 22001, "username": "root"},
+            "proxy": {"host": "ssh.runpod.io", "port": 22, "username": "pod-token"}
+        })).unwrap());
+        app.select(0, "running".into());
+        let items = crate::palette::items(&app, crate::palette::Menu::Root);
+        assert!(items.iter().any(|i| i.label == "SSH into pod" && matches!(i.act, crate::palette::Act::Run(Cmd::Shell))));
+        let footer = footer(&app);
+        assert!(footer.contains("s ssh"));
+        assert!(!footer.contains(" log ") && !footer.contains(" cancel "));
+        assert!(matches!(app.run(Cmd::Shell), Next::PodShell(e) if e.host == "ssh.runpod.io" && e.username == "pod-token"));
+        assert!(matches!(press(&mut app, KeyCode::Enter), Next::PodShell(e) if e.host == "ssh.runpod.io"));
+        running(&mut app).pod.as_mut().unwrap().ssh.as_mut().unwrap().proxy = None;
+        assert!(matches!(app.shell_target(), Next::PodShell(e) if e.host == "192.0.2.1" && e.port == 22001 && e.username == "root"));
+        running(&mut app).state = "EXITED".into();
+        assert!(matches!(app.shell_target(), Next::Continue));
+        assert_eq!(app.toast.as_ref().unwrap().0, "SSH requires a running pod");
+        let items = crate::palette::items(&app, crate::palette::Menu::Root);
+        assert!(!items.iter().any(|i| matches!(i.act, crate::palette::Act::Run(Cmd::Shell))));
+    }
+
+    #[test]
+    fn pod_detail_fits_four_gpus_and_overflow_count() {
+        let mut app = pod_app();
+        let jobs = app.clusters[0].jobs.as_mut().unwrap();
+        jobs.retain(|j| j.id == "running");
+        jobs[0].pod.as_mut().unwrap().gpus = (1..=5).map(|i| crate::runpod::Usage { util: Some(i as f64 * 10.0), memory_util: None }).collect();
+        app.fix_selection();
+        let screen = screen(&app);
+        assert!(screen.contains("util 40%"));
+        assert!(screen.contains("+1 more GPUs"));
+    }
+
     #[test]
     fn gpu_readings_land_on_their_cluster_and_end_loading() {
         let mut app = App::new(Config::default(), Vec::new());
@@ -1096,7 +1318,7 @@ mod tests {
 
     #[test]
     fn number_keys_focus_a_cluster() {
-        let cl = |host: &str| crate::config::ClusterConf { host: host.into(), prefix: String::new() };
+        let cl = |host: &str| crate::config::ClusterConf { host: host.into(), ..Default::default() };
         let config = Config { clusters: vec![cl("a"), cl("b")], ..Config::default() };
         let mut app = App::new(config, Vec::new());
         app.clusters[0].jobs = Some(vec![job("1", "x", "RUNNING")]);

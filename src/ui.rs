@@ -41,6 +41,9 @@ fn panel() -> Block<'static> {
 
 /// Running jobs get two rows per GPU (util and memory bars), up to 4 GPUs.
 fn detail_height(app: &App) -> u16 {
+    if let Some(p) = app.selected_job().and_then(|(_, _, j)| j.pod.as_ref()) {
+        return (5 + p.gpus.len().clamp(1, 4) as u16 + u16::from(p.gpus.len() > 4)).max(8);
+    }
     match app.selected_job() {
         Some((_, _, j)) if j.running() => {
             let gpus = j.gpus.len().clamp(1, 4) as u16;
@@ -98,8 +101,21 @@ pub fn draw(f: &mut Frame, app: &App) -> MouseTargets {
         draw_log(f, app, v);
     }
     match &app.popup {
+        Some(Popup::ConfirmPod { id, name, action }) => {
+            let area = centered(f.area(), 68, 10);
+            clear(f, area);
+            let lines = vec![
+                Line::from(format!("{} {name}?", action.title())),
+                Line::from(dim(format!("pod {id}"))),
+                Line::from(action.warning()),
+                Line::from(if *action == crate::runpod::Action::Terminate { "Cannot be undone. Network volumes are kept and still billed." } else { "" }),
+                Line::from(""),
+                Line::from(vec![key("y"), dim(" confirm    "), key("any other key"), dim(" back")]),
+            ];
+            f.render_widget(Paragraph::new(lines).block(panel().padding(Padding::horizontal(1))), area);
+        }
         Some(Popup::Help) => draw_help(f),
-        Some(Popup::ConfirmCancel { ci, id, name }) => draw_confirm(f, &app.clusters[*ci].host, id, name),
+        Some(Popup::ConfirmCancel { ci, id, name }) => draw_confirm(f, app.clusters[*ci].host(), id, name),
         None => {}
     }
     if let Some(p) = &app.palette {
@@ -110,12 +126,14 @@ pub fn draw(f: &mut Frame, app: &App) -> MouseTargets {
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     let jobs = app.clusters.iter().flat_map(|c| c.jobs.iter().flatten()).filter(|j| !j.finished());
-    let (running, queued) = jobs.fold((0, 0), |(r, q), j| if j.running() { (r + 1, q) } else { (r, q + 1) });
+    let (running, queued) = jobs.fold((0, 0), |(r, q), j| {
+        (r + usize::from(j.running()), q + usize::from(!j.running() && j.pod.is_none()))
+    });
     let gpus: usize = app
         .clusters
         .iter()
         .flat_map(|c| c.jobs.iter().flatten())
-        .map(|j| j.gpus.len())
+        .map(|j| j.pod.as_ref().map_or(j.gpus.len(), |p| if j.running() { p.gpu_count as usize } else { 0 }))
         .sum();
     let left = Line::from(vec![
         Span::styled(" gpudash ", Style::new().fg(t().background.unwrap_or(Color::Black)).bg(t().accent).bold()),
@@ -128,7 +146,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     if app.clusters.len() > 1 {
         left.push_span(dim("   "));
         for (i, c) in app.clusters.iter().take(9).enumerate() {
-            let label = format!(" {} {} ", i + 1, c.host);
+            let label = format!(" {} {} ", i + 1, c.host());
             left.push_span(if app.focus == Some(i) {
                 Span::styled(label, Style::new().fg(t().background.unwrap_or(Color::Black)).bg(t().accent).bold())
             } else {
@@ -172,12 +190,16 @@ fn draw_clusters(f: &mut Frame, area: Rect, app: &App, targets: &mut MouseTarget
 }
 
 fn draw_cluster(f: &mut Frame, area: Rect, app: &App, ci: usize, c: &Cluster, jobs: &[&Job], targets: &mut MouseTargets) {
-    let mut title = vec![Span::styled(format!(" {} ", c.host), Style::new().fg(t().text).bold())];
+    let mut title = vec![Span::styled(format!(" {} ", c.host()), Style::new().fg(t().text).bold())];
     if let Some(all) = &c.jobs {
         let r = all.iter().filter(|j| j.running()).count();
         let q = all.iter().filter(|j| !j.running() && !j.finished()).count();
         let d = all.iter().filter(|j| j.finished()).count();
-        let mut counts = format!("{r} running · {q} queued");
+        let mut counts = if c.source.is_runpod() {
+            let rate: f64 = all.iter().filter(|j| j.running() || j.state == "STARTING")
+                .filter_map(|j| j.pod.as_ref().map(|p| p.hourly_rate)).sum();
+            format!("{r} running · {} other · ${rate:.3}/h active compute", all.len() - r)
+        } else { format!("{r} running · {q} queued") };
         if d > 0 {
             let recent = app.config.recent_ended;
             counts += &match app.config.ended_jobs {
@@ -206,9 +228,11 @@ fn draw_cluster(f: &mut Frame, area: Rect, app: &App, ci: usize, c: &Cluster, jo
 
     if jobs.is_empty() {
         let msg = match (&c.jobs, c.loading) {
+            (None, true) if c.source.is_runpod() => " waiting for Runpod…",
             (None, true) => " waiting for Slurm…",
             (None, false) => "",
             (Some(_), _) if !app.filter.is_empty() => " nothing matches the filter",
+            _ if c.source.is_runpod() => " no pods",
             _ => " no jobs",
         };
         f.render_widget(Paragraph::new(dim(msg)).block(block), area);
@@ -216,13 +240,17 @@ fn draw_cluster(f: &mut Frame, area: Rect, app: &App, ci: usize, c: &Cluster, jo
     }
 
     let since = c.fetched.map_or(0, |t| t.elapsed().as_secs());
-    let header = Row::new(["id", "name", "state", "gpu", "time", "temp / start", "folder"]).style(Style::new().fg(t().dim));
-    let rows: Vec<Row> = jobs.iter().map(|j| job_row(j, &c.prefix, since)).collect();
+    let is_runpod = c.source.is_runpod();
+    let columns = if is_runpod {
+        ["id", "name", "state", "gpu", "uptime", "GPU util / memory", "compute rate"]
+    } else { ["id", "name", "state", "gpu", "time", "temp / start", "folder"] };
+    let header = Row::new(columns).style(Style::new().fg(t().dim));
+    let rows: Vec<Row> = jobs.iter().map(|j| job_row(j, &c.source.prefix, since)).collect();
     let widths = [
         Constraint::Length(10),
         Constraint::Length(22),
-        Constraint::Length(7),
-        Constraint::Length(8),
+        Constraint::Length(if is_runpod { 14 } else { 7 }),
+        Constraint::Length(if is_runpod { 18 } else { 8 }),
         Constraint::Length(TIME_BAR as u16 + 11),
         Constraint::Length(23),
         Constraint::Fill(1),
@@ -251,6 +279,19 @@ fn draw_cluster(f: &mut Frame, area: Rect, app: &App, ci: usize, c: &Cluster, jo
 }
 
 fn job_row(j: &Job, prefix: &str, since: u64) -> Row<'static> {
+    if let Some(p) = &j.pod {
+        let (symbol, label, color) = pod_state_look(&j.state);
+        let usage = p.gpus.first().map_or("— / —".into(), |g| {
+            format!("{} / {}", percent(g.util), percent(g.memory_util))
+        });
+        return Row::new(vec![
+            Cell::from(dim(j.id.clone())), Cell::from(text(j.name.clone())),
+            Cell::from(Span::styled(format!("{symbol} {label}"), Style::new().fg(color))),
+            Cell::from(text(j.gpu_label.clone())),
+            Cell::from(text(j.used.map_or_else(|| "—".into(), |u| dur(Some(u + if j.running() { since } else { 0 }))))),
+            Cell::from(text(usage)), Cell::from(text(format!("${:.3}/h", p.hourly_rate))),
+        ]);
+    }
     let (dot, label, color) = state_look(&j.state);
     let state = Line::from(Span::styled(format!("{dot} {label}"), Style::new().fg(color)));
     let ended = j.finished();
@@ -321,13 +362,28 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
         f.render_widget(block, area);
         return;
     };
-    let (dot, _, color) = state_look(&j.state);
+    let (dot, _, color) = if j.pod.is_some() { pod_state_look(&j.state) } else { state_look(&j.state) };
     let block = block.title(Line::from(vec![
         Span::styled(format!(" {dot} "), Style::new().fg(color)),
         Span::styled(format!("{} ", j.name), Style::new().fg(t().text).bold()),
-        dim(format!("{} · {} ", j.id, c.host)),
+        dim(format!("{} · {} ", j.id, c.host())),
     ]));
     let label = |s: &'static str| dim(format!("{s:<8}"));
+    if let Some(p) = &j.pod {
+        let (_, state, _) = pod_state_look(&j.state);
+        let mut lines = vec![
+            Line::from(vec![label("state"), Span::styled(state.to_string(), Style::new().fg(color)), dim(format!(" · {}", j.gpu_label))]),
+            Line::from(vec![label("rate"), text(format!("${:.3}/h compute · storage billed separately", p.hourly_rate))]),
+            Line::from(vec![label("host"), text(format!("CPU {} · RAM {}", percent(p.cpu_percent), percent(p.memory_percent)))]),
+        ];
+        for (i, g) in p.gpus.iter().take(4).enumerate() {
+            lines.push(Line::from(vec![dim(format!("gpu {i:<4}")), text(format!("util {} · memory {}", percent(g.util), percent(g.memory_util)))]));
+        }
+        if p.gpus.is_empty() { lines.push(Line::from(dim("GPU readings unavailable"))); }
+        if p.gpus.len() > 4 { lines.push(Line::from(dim(format!("+{} more GPUs", p.gpus.len() - 4)))); }
+        f.render_widget(Paragraph::new(lines).block(block), area);
+        return;
+    }
     let mut lines = vec![Line::from(vec![label("folder"), text(j.workdir.clone())])];
 
     let history = app.temp_history.get(&(ci, j.id.clone())).filter(|h| h.len() >= 2);
@@ -407,6 +463,10 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+fn percent(value: Option<f64>) -> String {
+    value.map_or_else(|| "—".into(), |v| format!("{v:.0}%"))
+}
+
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     if app.filtering || !app.filter.is_empty() {
         let mut spans = vec![key(" /"), text(app.filter.clone())];
@@ -418,17 +478,34 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         }
         f.render_widget(Paragraph::new(Line::from(spans)), area);
     } else {
-        let hints = Line::from(vec![
+        let mut hints = vec![
             key(" ↑↓"), dim(" move  "),
             key("p"), dim(" commands  "),
-            key("enter"), dim(" log  "),
-            key("s"), dim(" shell  "),
-            key("x"), dim(" cancel  "),
+        ];
+        match app.selected_job() {
+            Some((_, c, j)) if c.source.is_runpod() => {
+                if j.pod_ssh().is_some() {
+                    hints.extend([key("enter/s"), dim(" ssh  ")]);
+                }
+                if let Some(action) = j.pod.as_ref().and_then(|p| p.x_action(&j.state)) {
+                    hints.extend([key("x"), dim(if action == crate::runpod::Action::Terminate { " delete  " } else { " stop  " })]);
+                }
+                if let Some(action) = j.pod.as_ref().and_then(|p| p.restart_action(&j.state)) {
+                    hints.extend([key("R"), dim(format!(" {}  ", action.verb()))]);
+                }
+            }
+            _ => hints.extend([
+                key("enter"), dim(" log  "),
+                key("s"), dim(" shell  "),
+                key("x"), dim(" cancel  "),
+            ]),
+        }
+        hints.extend([
             key("/"), dim(" filter  "),
             key("?"), dim(" help  "),
             key("q"), dim(" quit"),
         ]);
-        f.render_widget(Paragraph::new(hints), area);
+        f.render_widget(Paragraph::new(Line::from(hints)), area);
     }
     if let Some((msg, err, when)) = &app.toast {
         if when.elapsed().as_secs() < TOAST_SECS {
@@ -446,7 +523,7 @@ fn draw_log(f: &mut Frame, app: &App, v: &LogView) {
     let path = v.log.as_ref().map_or(String::new(), |l| format!("{} · {}", shorten(&l.path, 60), size(l.size)));
     let mut title = vec![
         Span::styled(format!(" {} ", v.name), Style::new().fg(t().text).bold()),
-        dim(format!("{} · {} · {} ", v.id, c.host, if v.stderr { "stderr" } else { "stdout" })),
+        dim(format!("{} · {} · {} ", v.id, c.host(), if v.stderr { "stderr" } else { "stdout" })),
     ];
     if v.loading {
         title.extend([spinner(app.tick), Span::raw(" ")]);
@@ -510,8 +587,9 @@ fn draw_help(f: &mut Frame) {
         ("click", "select a job or run a palette item"),
         ("g G", "first / last job"),
         ("enter  l", "open the job's log (h or esc to go back)"),
-        ("s", "shell into the job (its GPU node if running)"),
-        ("x", "cancel the job"),
+        ("s", "shell into the job or SSH into a running Runpod pod"),
+        ("x", "cancel job; stop pod, or delete if stopped (asks first)"),
+        ("R", "restart a running pod or start a stopped pod"),
         ("y", "copy the job id"),
         ("1 2 3…", "show one cluster (same number or 0: all)"),
         ("/", "filter by name, folder or id"),

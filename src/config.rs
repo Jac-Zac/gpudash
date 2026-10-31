@@ -27,13 +27,42 @@ pub enum ClockFormat {
     H24,
 }
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[derive(Serialize, Deserialize, Clone, Copy, Default, PartialEq, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum Provider {
+    #[default]
+    Slurm,
+    Runpod,
+}
+
+impl Provider {
+    fn is_slurm(&self) -> bool {
+        *self == Provider::Slurm
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq, Debug)]
+#[serde(default)]
 pub struct ClusterConf {
-    /// ssh host alias
+    /// left out of the file for Slurm, so existing configs save exactly as before
+    #[serde(skip_serializing_if = "Provider::is_slurm")]
+    pub provider: Provider,
+    /// SSH host alias, or an optional display label for Runpod.
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub host: String,
     /// folder prefix hidden in the table
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub prefix: String,
+}
+
+impl ClusterConf {
+    pub fn is_runpod(&self) -> bool {
+        self.provider == Provider::Runpod
+    }
+
+    pub fn label(&self) -> &str {
+        if self.host.is_empty() { "runpod" } else { &self.host }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -101,7 +130,8 @@ const HEADER: &str = "\
 # flip_log_scroll    flip the wheel direction in the log view
 #
 # [[cluster]]        one block per cluster
-# host               ssh host alias from ~/.ssh/config
+# provider           \"slurm\" (default) or \"runpod\"
+# host               ssh host alias; optional label for Runpod
 # prefix             (optional) folder prefix to hide in the table
 
 ";
@@ -121,8 +151,13 @@ pub fn path() -> Option<PathBuf> {
 pub fn load() -> (Config, Option<String>) {
     let Some(path) = path() else { return (Config::default(), None) };
     match std::fs::read_to_string(&path) {
-        Ok(text) => match toml::from_str(&text) {
-            Ok(c) => (c, None),
+        Ok(text) => match toml::from_str::<Config>(&text) {
+            Ok(c) => {
+                if c.clusters.iter().any(|c| c.provider == Provider::Slurm && c.host.trim().is_empty()) {
+                    return (Config::default(), Some("Slurm clusters need a host".into()));
+                }
+                (c, None)
+            }
             Err(e) => (Config::default(), Some(format!("{}: {}", path.display(), e.message()))),
         },
         Err(_) => (migrate_old().unwrap_or_default(), None),
@@ -142,6 +177,7 @@ fn migrate_old() -> Option<Config> {
             ClusterConf {
                 host: parts.next().unwrap_or_default().to_string(),
                 prefix: parts.next().unwrap_or_default().to_string(),
+                ..ClusterConf::default()
             }
         })
         .collect();
@@ -166,7 +202,7 @@ mod tests {
     #[test]
     fn round_trip() {
         let c = Config {
-            clusters: vec![ClusterConf { host: "explorer".into(), prefix: "/projects/me/".into() }],
+            clusters: vec![ClusterConf { host: "explorer".into(), prefix: "/projects/me/".into(), ..ClusterConf::default() }],
             clock: ClockFormat::H24,
             ..Config::default()
         };
@@ -182,5 +218,19 @@ mod tests {
         let c: Config = toml::from_str("[[cluster]]\nhost = \"x\"\n").unwrap();
         assert_eq!(c.refresh_seconds, 30);
         assert_eq!(c.clusters[0].prefix, "");
+    }
+
+    #[test]
+    fn mixed_providers_round_trip_and_slurm_saves_as_before() {
+        let config: Config = toml::from_str("[[cluster]]\nhost = 'myriad-ng'\n[[cluster]]\nprovider = 'runpod'\n").unwrap();
+        assert_eq!(config.clusters[0].provider, Provider::Slurm);
+        assert_eq!(config.clusters[1].label(), "runpod");
+        let saved = toml::to_string(&config).unwrap();
+        let back: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(back.clusters, config.clusters);
+        assert_eq!(saved.matches("provider").count(), 1, "only the Runpod block names a provider");
+        // a per-cluster refresh_seconds left over from an earlier build is ignored, not an error
+        let old: Config = toml::from_str("[[cluster]]\nprovider = 'runpod'\nrefresh_seconds = 0\n").unwrap();
+        assert_eq!(old.clusters[0].provider, Provider::Runpod);
     }
 }

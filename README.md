@@ -153,6 +153,28 @@ host = "explorer"           # ssh Host name
 prefix = "/projects/me/"    # optional: hidden from the folder column
 ```
 
+### Runpod pods
+
+```toml
+[[cluster]]
+provider = "runpod"
+host = "pods"               # optional label; "runpod" by default
+```
+
+Shows your pods with their GPUs, usage, uptime and hourly rate. On a pod, `enter` / `s`
+SSHes in (SSH must be enabled and your key added to Runpod), `x` stops it (or deletes it
+once stopped) and `R` starts or restarts it. Each action asks first.
+
+Create an [API key](https://docs.runpod.io/get-started/credentials) with Pod read and
+write access, and save it in `~/.runpod/config.toml` (then `chmod 600` it):
+
+```toml
+apikey = 'YOUR_KEY'
+```
+
+`RUNPOD_API_KEY` or a macOS Keychain password named `runpod` also work. Background
+notifications can't see shell variables, so use the file or Keychain for those.
+
 ### Making a theme
 
 On first run gpudash copies its built-in themes to `~/.config/gpudash/themes/`. Copy one,
