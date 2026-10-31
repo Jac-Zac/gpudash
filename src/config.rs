@@ -52,6 +52,8 @@ pub struct Config {
     pub temperature_unit: TempUnit,
     pub clock: ClockFormat,
     pub temperature_graph: bool,
+    pub flip_list_scroll: bool,
+    pub flip_log_scroll: bool,
     #[serde(rename = "cluster")]
     pub clusters: Vec<ClusterConf>,
 }
@@ -72,6 +74,8 @@ impl Default for Config {
             temperature_unit: TempUnit::C,
             clock: ClockFormat::H12,
             temperature_graph: true,
+            flip_list_scroll: true,
+            flip_log_scroll: false,
             clusters: Vec::new(),
         }
     }
@@ -93,6 +97,8 @@ const HEADER: &str = "\
 # temperature_unit   \"C\" or \"F\"
 # clock              \"12h\" or \"24h\"
 # temperature_graph  show the temperature graph for running jobs
+# flip_list_scroll   flip the wheel direction in the job list and palette
+# flip_log_scroll    flip the wheel direction in the log view
 #
 # [[cluster]]        one block per cluster
 # host               ssh host alias from ~/.ssh/config

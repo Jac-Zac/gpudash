@@ -82,6 +82,10 @@ pub struct App {
     cli_clusters: bool,
     next_uid: usize,
     pub paused: bool,
+    /// show only this cluster (index); None shows them all
+    pub focus: Option<usize>,
+    /// when the wheel last moved a list, to slow down trackpads
+    pub last_wheel: Option<Instant>,
     /// when the log view was last closed (to ignore leftover trackpad scrolling)
     pub log_closed: Option<Instant>,
     /// theme currently on screen (differs from config.theme while previewing in the palette)
@@ -122,6 +126,8 @@ impl App {
             cli_clusters,
             next_uid: 0,
             paused: false,
+            focus: None,
+            last_wheel: None,
             log_closed: None,
             theme_shown: String::new(),
             palette: None,
@@ -226,6 +232,7 @@ impl App {
     fn forget_positions(&mut self) {
         self.selected = None;
         self.moved = false;
+        self.focus = None;
         self.log = None;
         self.popup = None;
         self.temp_history.clear();
@@ -411,8 +418,20 @@ impl App {
         self.clusters
             .iter()
             .enumerate()
+            .filter(|(i, _)| self.focus.is_none_or(|f| f == *i))
             .flat_map(|(i, c)| self.visible(c).into_iter().map(move |j| (i, j.id.clone())))
             .collect()
+    }
+
+    /// Number keys: 1, 2, 3… show one cluster; 0 or the same number again shows them all.
+    pub fn focus_cluster(&mut self, number: usize) {
+        if number > self.clusters.len() {
+            self.say(format!("no cluster {number}"), true);
+            return;
+        }
+        let want = number.checked_sub(1);
+        self.focus = if want == self.focus { None } else { want };
+        self.fix_selection();
     }
 
     /// Keep the selection on a visible job; until the user moves, stick to the top one.
@@ -633,6 +652,16 @@ impl App {
             Cmd::Clock(k) => {
                 c.clock = k;
                 self.save(if k == ClockFormat::H12 { "12-hour clock" } else { "24-hour clock" });
+            }
+            Cmd::ToggleListScroll => {
+                c.flip_list_scroll = !c.flip_list_scroll;
+                let on = c.flip_list_scroll;
+                self.save(if on { "list scrolling flipped" } else { "list scrolling normal" });
+            }
+            Cmd::ToggleLogScroll => {
+                c.flip_log_scroll = !c.flip_log_scroll;
+                let on = c.flip_log_scroll;
+                self.save(if on { "log scrolling flipped" } else { "log scrolling normal" });
             }
             Cmd::ToggleGraph => {
                 c.temperature_graph = !c.temperature_graph;
@@ -1063,6 +1092,27 @@ mod tests {
         assert!(!app.clusters[0].loading);
         assert_eq!(app.clusters[0].error.as_deref(), Some("GPU check failed: timed out"));
         assert!(app.clusters[0].jobs.as_ref().unwrap()[0].running(), "job states stay");
+    }
+
+    #[test]
+    fn number_keys_focus_a_cluster() {
+        let cl = |host: &str| crate::config::ClusterConf { host: host.into(), prefix: String::new() };
+        let config = Config { clusters: vec![cl("a"), cl("b")], ..Config::default() };
+        let mut app = App::new(config, Vec::new());
+        app.clusters[0].jobs = Some(vec![job("1", "x", "RUNNING")]);
+        app.clusters[1].jobs = Some(vec![job("2", "y", "RUNNING")]);
+        app.fix_selection();
+
+        app.focus_cluster(2);
+        assert_eq!(app.focus, Some(1));
+        assert_eq!(app.selected, Some((1, "2".to_string())));
+        app.focus_cluster(2); // same number again: all
+        assert_eq!(app.focus, None);
+        app.focus_cluster(1);
+        app.focus_cluster(0);
+        assert_eq!(app.focus, None);
+        app.focus_cluster(3); // no such cluster
+        assert_eq!(app.focus, None);
     }
 
     #[test]

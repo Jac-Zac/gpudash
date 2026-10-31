@@ -124,6 +124,18 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(format!("{queued} queued"), Style::new().fg(t().queued)),
         dim(format!(" · {gpus} GPUs in use")),
     ]);
+    let mut left = left;
+    if app.clusters.len() > 1 {
+        left.push_span(dim("   "));
+        for (i, c) in app.clusters.iter().take(9).enumerate() {
+            let label = format!(" {} {} ", i + 1, c.host);
+            left.push_span(if app.focus == Some(i) {
+                Span::styled(label, Style::new().fg(t().background.unwrap_or(Color::Black)).bg(t().accent).bold())
+            } else {
+                dim(label)
+            });
+        }
+    }
     let mut right = vec![];
     if !app.config.notifications {
         right.push(dim("notifications off · "));
@@ -142,7 +154,8 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_clusters(f: &mut Frame, area: Rect, app: &App, targets: &mut MouseTargets) {
-    let visible: Vec<Vec<&Job>> = app.clusters.iter().map(|c| app.visible(c)).collect();
+    let shown: Vec<usize> = (0..app.clusters.len()).filter(|i| app.focus.is_none_or(|f| f == *i)).collect();
+    let visible: Vec<Vec<&Job>> = shown.iter().map(|&i| app.visible(&app.clusters[i])).collect();
     let heights: Vec<u16> = visible
         .iter()
         .map(|v| if v.is_empty() { 3 } else { v.len() as u16 + 3 })
@@ -153,8 +166,8 @@ fn draw_clusters(f: &mut Frame, area: Rect, app: &App, targets: &mut MouseTarget
         heights.iter().map(|&h| Constraint::Fill(h)).collect()
     };
     let areas = Layout::vertical(constraints).split(area);
-    for (i, c) in app.clusters.iter().enumerate() {
-        draw_cluster(f, areas[i], app, i, c, &visible[i], targets);
+    for (slot, &i) in shown.iter().enumerate() {
+        draw_cluster(f, areas[slot], app, i, &app.clusters[i], &visible[slot], targets);
     }
 }
 
@@ -500,6 +513,7 @@ fn draw_help(f: &mut Frame) {
         ("s", "shell into the job (its GPU node if running)"),
         ("x", "cancel the job"),
         ("y", "copy the job id"),
+        ("1 2 3…", "show one cluster (same number or 0: all)"),
         ("/", "filter by name, folder or id"),
         ("e", "ended jobs: recent → all from 24h → hidden"),
         ("n", "turn Mac notifications on / off"),

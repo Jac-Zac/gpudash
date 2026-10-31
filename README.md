@@ -114,6 +114,7 @@ gpudash saves them, so next time plain `gpudash` shows them all.
 | `s`           | shell into the job                              |
 | `x`           | cancel the job                                  |
 | `y`           | copy the job id                                 |
+| `1` `2` `3`…  | show one cluster (same number or `0`: all)      |
 | `/`           | filter                                          |
 | `e`           | ended jobs: recent → all from 24h → hidden      |
 | `n`           | notifications on / off                          |
@@ -121,7 +122,7 @@ gpudash saves them, so next time plain `gpudash` shows them all.
 | `?`           | all keys                                        |
 | `q`           | quit                                            |
 | left click    | select a job, or run a command palette item      |
-| scroll wheel  | move, or scroll the log                         |
+| scroll wheel  | move, or scroll the log (`p` → *Flip list/log scrolling*) |
 
 gpudash uses the mouse, so to select text in the terminal hold **Shift** while dragging.
 
@@ -144,6 +145,8 @@ notify_sound = false
 temperature_unit = "C"      # or "F"
 clock = "12h"               # or "24h"
 temperature_graph = true
+flip_list_scroll = true     # wheel direction in the job list and palette
+flip_log_scroll = false     # wheel direction in the log
 
 [[cluster]]
 host = "explorer"           # ssh Host name

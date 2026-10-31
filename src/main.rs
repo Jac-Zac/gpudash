@@ -225,6 +225,8 @@ fn suspend(terminal: &mut DefaultTerminal, f: impl FnOnce() -> std::io::Result<(
     Ok(())
 }
 
+/// Shortest time between two rows when scrolling a list with the wheel.
+const WHEEL_GAP: Duration = Duration::from_millis(35);
 /// Lines the log moves per scroll-wheel tick.
 const WHEEL_LINES: isize = 3;
 /// A trackpad keeps sending scroll events for a moment after a flick. Scroll events that
@@ -251,16 +253,21 @@ fn on_mouse(app: &mut App, m: MouseEvent, targets: &ui::MouseTargets) -> Next {
         MouseEventKind::ScrollDown => 1,
         _ => return Next::Continue,
     };
+    let list_delta = if app.config.flip_list_scroll { -delta } else { delta };
     if app.palette.is_some() {
+        if !wheel_ready(app) {
+            return Next::Continue;
+        }
         // in the palette a wheel tick works like ↑ / ↓ (including the theme preview)
-        let code = if delta < 0 { KeyCode::Up } else { KeyCode::Down };
+        let code = if list_delta < 0 { KeyCode::Up } else { KeyCode::Down };
         return palette_key(app, KeyEvent::new(code, KeyModifiers::NONE));
     }
     if app.popup.is_some() || app.filtering {
         return Next::Continue;
     }
     if app.log.is_some() {
-        scroll_log(app, delta * WHEEL_LINES);
+        let log_delta = if app.config.flip_log_scroll { -delta } else { delta };
+        scroll_log(app, log_delta * WHEEL_LINES);
         return Next::Continue;
     }
     if let Some(closed) = app.log_closed {
@@ -270,8 +277,19 @@ fn on_mouse(app: &mut App, m: MouseEvent, targets: &ui::MouseTargets) -> Next {
         }
         app.log_closed = None;
     }
-    app.step(delta);
+    if wheel_ready(app) {
+        app.step(list_delta);
+    }
     Next::Continue
+}
+
+/// Trackpads send many ticks per swipe, so lists move at most one row per `WHEEL_GAP`.
+fn wheel_ready(app: &mut App) -> bool {
+    if app.last_wheel.is_some_and(|t| t.elapsed() < WHEEL_GAP) {
+        return false;
+    }
+    app.last_wheel = Some(Instant::now());
+    true
 }
 
 /// Move the log view by `delta` lines (negative = up). Reaching the end resumes following.
@@ -355,6 +373,7 @@ fn on_key(app: &mut App, k: KeyEvent) -> Next {
             app.filter.clear();
             app.fix_selection();
         }
+        KeyCode::Esc if app.focus.is_some() => app.focus_cluster(0),
         KeyCode::Esc => return Next::Quit,
         KeyCode::Char('r') => app.refresh(),
         KeyCode::Down | KeyCode::Char('j') => app.step(1),
@@ -367,6 +386,7 @@ fn on_key(app: &mut App, k: KeyEvent) -> Next {
         KeyCode::Char('x') => app.ask_cancel(),
         KeyCode::Char('y') => app.copy_id(),
         KeyCode::Char('/') => app.filtering = true,
+        KeyCode::Char(c @ '0'..='9') => app.focus_cluster(c as usize - '0' as usize),
         KeyCode::Char('?') => app.popup = Some(Popup::Help),
         KeyCode::Char('e') => app.cycle_ended(),
         KeyCode::Char('n') => return app.run(palette::Cmd::ToggleNotify),
