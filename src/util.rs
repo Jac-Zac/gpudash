@@ -82,6 +82,19 @@ pub fn big_bar(frac: f64, width: usize, from: (u8, u8, u8), to: (u8, u8, u8)) ->
     spans
 }
 
+/// (symbol, full label, color) for a Runpod state. Normal lifecycle endings aren't errors.
+pub fn pod_state_look(state: &str) -> (&str, &str, Color) {
+    match state {
+        "RUNNING" => ("✓", "running", t().running),
+        "EXITED" => ("‖", "stopped", t().warning),
+        "PROVISIONING" => ("◍", "provisioning", t().accent),
+        "STARTING" => ("◍", "starting", t().accent),
+        "TERMINATED" => ("⊘", "terminated", t().dim),
+        "ERROR" => ("✗", "error", t().failed),
+        _ => ("·", state, t().dim),
+    }
+}
+
 /// (symbol, short label, color) for a Slurm state
 pub fn state_look(state: &str) -> (&'static str, &'static str, Color) {
     match state {

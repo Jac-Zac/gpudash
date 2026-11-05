@@ -138,8 +138,8 @@ fn poll_all(config: &config::Config) {
         .clusters
         .iter()
         .map(|c| {
-            let (host, config) = (c.host.clone(), config.clone());
-            thread::spawn(move || poll_one(&host, &config))
+            let (source, config) = (c.clone(), config.clone());
+            thread::spawn(move || poll_one(&source, &config))
         })
         .collect();
     for h in handles {
@@ -147,10 +147,12 @@ fn poll_all(config: &config::Config) {
     }
 }
 
-fn poll_one(host: &str, config: &config::Config) {
-    match remote::fetch_jobs(host) {
+fn poll_one(source: &config::ClusterConf, config: &config::Config) {
+    let host = source.label();
+    match remote::fetch(source) {
         Ok(snap) => {
             let notes = match load_seen(host) {
+                Some((_, old)) if source.is_runpod() => crate::runpod::changes(host, &old, &snap.jobs, config),
                 Some((since, old)) => crate::app::job_changes(host, &old, &snap.jobs, Some(since), config),
                 None => Vec::new(),
             };

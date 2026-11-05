@@ -7,6 +7,7 @@ mod highlight;
 mod notifier;
 mod palette;
 mod remote;
+mod runpod;
 mod theme;
 mod ui;
 mod util;
@@ -180,6 +181,15 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
                         remote::shell(&host, &workdir, running_id.as_deref())
                     })?;
                 }
+                Next::PodShell(endpoint) => {
+                    suspend(terminal, || {
+                        println!("\n  gpudash → {}@{}:{}  (exit the shell to come back)\n", endpoint.username, endpoint.host, endpoint.port);
+                        if let Err(e) = endpoint.connect() {
+                            app.say(e.to_string(), true);
+                        }
+                        Ok(())
+                    })?;
+                }
                 Next::EditConfig => {
                     let Some(path) = config::path() else { continue };
                     if !path.exists() {
@@ -314,9 +324,11 @@ fn on_key(app: &mut App, k: KeyEvent) -> Next {
 
     // popups take the key first
     if let Some(popup) = app.popup.take() {
-        if let Popup::ConfirmCancel { ci, id, .. } = popup {
-            if matches!(k.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
-                app.cancel(ci, id);
+        if matches!(k.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+            match popup {
+                Popup::ConfirmCancel { ci, id, .. } => app.cancel(ci, id),
+                Popup::ConfirmPod { id, action, .. } => app.pod_action(id, action),
+                Popup::Help => {}
             }
         }
         return Next::Continue;
@@ -376,12 +388,16 @@ fn on_key(app: &mut App, k: KeyEvent) -> Next {
         KeyCode::Esc if app.focus.is_some() => app.focus_cluster(0),
         KeyCode::Esc => return Next::Quit,
         KeyCode::Char('r') => app.refresh(),
+        KeyCode::Char('R') => app.ask_restart_pod(),
         KeyCode::Down | KeyCode::Char('j') => app.step(1),
         KeyCode::Up | KeyCode::Char('k') => app.step(-1),
         KeyCode::PageDown => app.step(10),
         KeyCode::PageUp => app.step(-10),
         KeyCode::Home | KeyCode::Char('g') => app.jump(false),
         KeyCode::End | KeyCode::Char('G') => app.jump(true),
+        KeyCode::Enter if app.selected_job().is_some_and(|(_, c, _)| c.source.is_runpod()) => {
+            return app.shell_target();
+        }
         KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => app.open_log(),
         KeyCode::Char('x') => app.ask_cancel(),
         KeyCode::Char('y') => app.copy_id(),

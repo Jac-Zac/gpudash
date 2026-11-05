@@ -1,7 +1,6 @@
 //! Everything that talks to the clusters over ssh.
 
 use std::collections::HashMap;
-use std::fs::File;
 use std::io::{Read, Write};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
@@ -39,9 +38,17 @@ pub struct Job {
     pub partition: String,
     pub exit: String,
     pub gpus: Vec<Gpu>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod: Option<crate::runpod::PodDetails>,
 }
 
 impl Job {
+    pub fn pod_ssh(&self) -> Option<&crate::runpod::SshEndpoint> {
+        if !self.running() { return None; }
+        let ssh = self.pod.as_ref()?.ssh.as_ref()?;
+        ssh.proxy.as_ref().or(ssh.direct.as_ref())
+    }
+
     pub fn running(&self) -> bool {
         self.state == "RUNNING"
     }
@@ -58,6 +65,14 @@ pub struct Snapshot {
     pub jobs: Vec<Job>,
     /// job id -> (stdout pattern, stderr pattern), as squeue reports them
     pub outputs: HashMap<String, (String, String)>,
+}
+
+/// Fetch a snapshot from whichever provider the cluster uses.
+pub fn fetch(source: &crate::config::ClusterConf) -> Result<Snapshot, String> {
+    match source.provider {
+        crate::config::Provider::Slurm => fetch_jobs(&source.host),
+        crate::config::Provider::Runpod => crate::runpod::fetch(),
+    }
 }
 
 // Every line we read starts with @@, so login banners are ignored.
@@ -91,9 +106,7 @@ cat "$t"/* 2>/dev/null
 rm -rf "$t"
 "#;
 
-/// Time limits, so a hung connection shows an error instead of loading forever.
-const CHECK_LIMIT: Duration = Duration::from_secs(5);
-const CONNECT_LIMIT: Duration = Duration::from_secs(30);
+/// Time limit, so a hung connection shows an error instead of loading forever.
 const RUN_LIMIT: Duration = Duration::from_secs(60);
 
 /// Wait for a child process, killing it if it takes longer than `limit`.
@@ -112,56 +125,22 @@ fn wait_limit(child: &mut Child, limit: Duration) -> Option<ExitStatus> {
     }
 }
 
-/// Make sure a shared ssh connection is up, so each poll skips the login handshake.
-/// The master is started with no pipes attached, otherwise it would hold our output open.
-fn ensure_master(host: &str) -> Result<(), String> {
-    let mut check = Command::new("ssh")
-        .args(["-o", CONTROL_PATH, "-O", "check", host])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    match wait_limit(&mut check, CHECK_LIMIT) {
-        Some(s) if s.success() => return Ok(()),
-        Some(_) => {}
-        // the shared connection is wedged; keep-alives (below) make it exit on its own soon
-        None => return Err("ssh connection is stuck, retrying…".into()),
-    }
-    let errpath = std::env::temp_dir().join(format!("gpudash-{host}.err"));
-    let errfile = File::create(&errpath).map_err(|e| e.to_string())?;
-    let mut master = Command::new("ssh")
+/// Run a bash script on the login node and return its stdout.
+/// The command itself starts or reuses the shared connection (ControlMaster=auto), so a
+/// socket collision can't leave a stray `ssh -N` running forever.
+fn run(host: &str, script: &str) -> Result<String, String> {
+    let mut child = Command::new("ssh")
         .args([
             "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=10",
-            "-o", "ControlMaster=yes",
+            "-o", "ControlMaster=auto",
             "-o", "ControlPersist=10m",
             // notice a dead connection within ~45s and close it, so the next poll reconnects
             "-o", "ServerAliveInterval=15",
             "-o", "ServerAliveCountMax=3",
             "-o", CONTROL_PATH,
-            "-fN", host,
+            host, "bash -s",
         ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(errfile)
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    match wait_limit(&mut master, CONNECT_LIMIT) {
-        Some(s) if s.success() => return Ok(()),
-        Some(_) => {}
-        None => return Err(format!("couldn't connect within {}s", CONNECT_LIMIT.as_secs())),
-    }
-    let mut err = String::new();
-    let _ = File::open(&errpath).and_then(|mut f| f.read_to_string(&mut err));
-    Err(last_line(&err).unwrap_or("ssh failed").to_string())
-}
-
-/// Run a bash script on the login node and return its stdout.
-fn run(host: &str, script: &str) -> Result<String, String> {
-    ensure_master(host)?;
-    let mut child = Command::new("ssh")
-        .args(["-o", "BatchMode=yes", "-o", "ControlMaster=no", "-o", CONTROL_PATH, host, "bash -s"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -226,6 +205,7 @@ pub fn fetch_jobs(host: &str) -> Result<Snapshot, String> {
                 partition: f[11].into(),
                 exit: String::new(),
                 gpus: Vec::new(),
+                pod: None,
             }),
             "@@DONE" if f.len() >= 12 => {
                 // 'CANCELLED by 1234' -> 'CANCELLED'
@@ -249,6 +229,7 @@ pub fn fetch_jobs(host: &str) -> Result<Snapshot, String> {
                     partition: f[11].into(),
                     exit: f[7].into(),
                     gpus: Vec::new(),
+                    pod: None,
                 });
             }
             "@@OUT" if f.len() >= 4 => {
