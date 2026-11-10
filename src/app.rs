@@ -58,6 +58,8 @@ pub struct LogView {
     fetched_running: bool,
     /// first visible line; None = follow the end
     pub top: Option<usize>,
+    /// id of the fetch in flight, so a reply for an older request (other stream, job or view) is dropped
+    request: u64,
 }
 
 pub enum Popup {
@@ -78,7 +80,7 @@ pub enum Next {
 pub enum Msg {
     Jobs(usize, Result<Snapshot, String>), // (cluster uid, result)
     Gpus(usize, Result<HashMap<String, Vec<Gpu>>, String>), // (cluster uid, job id -> GPUs)
-    Log(String, bool, Result<Option<Log>, String>),
+    Log(u64, Result<Option<Log>, String>), // (request id, result)
     Cancelled(String, Result<(), String>),
     PodAction(String, crate::runpod::Action, Result<(), String>),
     Fairshare(usize, Result<Option<Fairshare>, String>), // (cluster uid, result)
@@ -111,6 +113,9 @@ pub struct App {
     pub toast: Option<(String, bool, Instant)>, // (message, is_error, when)
     /// (cluster, job id) -> max GPU temperature at each poll
     pub temp_history: HashMap<(usize, String), Vec<u64>>,
+    /// refresh interval from `-n`: used for this run only, never written to the config file
+    pub refresh_override: Option<u64>,
+    log_requests: u64,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
 }
@@ -151,6 +156,8 @@ impl App {
             log: None,
             toast: None,
             temp_history: HashMap::new(),
+            refresh_override: None,
+            log_requests: 0,
             tx,
             rx,
         };
@@ -187,12 +194,23 @@ impl App {
     }
 
     /// Save settings after a change from the palette.
-    fn save(&mut self, msg: impl Into<String>) {
+    pub fn save(&mut self, msg: impl Into<String>) {
         self.apply_display();
         let mut config = self.config.clone();
-        if self.cli_clusters {
-            // keep the file's cluster list; only settings changed
-            config.clusters = config::load().0.clusters;
+        if self.cli_clusters || self.refresh_override.is_some() {
+            // keep the file's cluster list and interval; they are only overridden for this run
+            let (file, err) = config::load();
+            if let Some(e) = err {
+                // saving now would replace the file's clusters with none
+                self.say(format!("couldn't save config: {e}"), true);
+                return;
+            }
+            if self.cli_clusters {
+                config.clusters = file.clusters;
+            }
+            if self.refresh_override.is_some() {
+                config.refresh_seconds = file.refresh_seconds;
+            }
         }
         match config::save(&config) {
             Ok(()) => self.say(msg, false),
@@ -232,6 +250,9 @@ impl App {
             self.forget_positions();
         }
         self.config = config;
+        if let Some(n) = self.refresh_override {
+            self.config.refresh_seconds = n;
+        }
         self.apply_display();
         match crate::theme::apply(&self.config.theme) {
             Ok(()) => {
@@ -285,14 +306,14 @@ impl App {
             // by a Gpus message, and the cluster stays loading until it arrives; Runpod sends only Jobs.
             // Fairshare comes last, so the slow sshare never holds up jobs or GPUs.
             thread::spawn(move || {
-                let jobs = remote::fetch(&source);
+                let jobs = guarded(|| remote::fetch(&source));
                 let running: Option<Vec<String>> = jobs.as_ref().ok()
                     .map(|s| s.jobs.iter().filter(|j| j.running()).map(|j| j.id.clone()).collect());
                 let _ = tx.send(Msg::Jobs(uid, jobs));
                 if !source.is_runpod() && let Some(ids) = running {
-                    let _ = tx.send(Msg::Gpus(uid, remote::fetch_gpus(&source.host, &ids)));
+                    let _ = tx.send(Msg::Gpus(uid, guarded(|| remote::fetch_gpus(&source.host, &ids))));
                     if fairshare {
-                        let _ = tx.send(Msg::Fairshare(uid, remote::fetch_fairshare(&source.host)));
+                        let _ = tx.send(Msg::Fairshare(uid, guarded(|| remote::fetch_fairshare(&source.host))));
                     }
                 }
             });
@@ -307,9 +328,11 @@ impl App {
         self.toast = Some((msg.into(), error, Instant::now()));
     }
 
-    /// Handle finished background work. Called every frame.
-    pub fn receive(&mut self) {
+    /// Handle finished background work. Called every frame; returns whether anything arrived.
+    pub fn receive(&mut self) -> bool {
+        let mut changed = false;
         while let Ok(msg) = self.rx.try_recv() {
+            changed = true;
             match msg {
                 Msg::Jobs(uid, result) => {
                     if let Some(i) = self.clusters.iter().position(|c| c.uid == uid) {
@@ -329,8 +352,8 @@ impl App {
                         }
                     }
                 }
-                Msg::Log(id, stderr, result) => {
-                    if let Some(v) = self.log.as_mut().filter(|v| v.id == id && v.stderr == stderr) {
+                Msg::Log(request, result) => {
+                    if let Some(v) = self.log.as_mut().filter(|v| v.loading && v.request == request) {
                         v.loading = false;
                         v.fetched = Instant::now();
                         match result {
@@ -361,8 +384,12 @@ impl App {
                 }
             }
         }
-        self.fix_selection();
+        // other changes to what's visible fix the selection themselves; this is per frame, so skip idle ones
+        if changed || self.selected.is_none() {
+            self.fix_selection();
+        }
         self.auto_refresh_log();
+        changed
     }
 
     fn got_jobs(&mut self, i: usize, result: Result<Snapshot, String>) {
@@ -377,17 +404,17 @@ impl App {
             }
         };
         // compare against the last snapshot, whether this dashboard or the background daemon took it
-        let previous = crate::background::load_seen(c.host())
-            .map(|(when, jobs)| (Some(when), jobs))
-            .or_else(|| c.jobs.clone().map(|jobs| (None, jobs)));
-        if self.config.notifications {
-            if let Some((since, old)) = &previous {
-                let notes = if c.source.is_runpod() {
-                    crate::runpod::changes(c.host(), old, &snap.jobs, &self.config)
-                } else { job_changes(c.host(), old, &snap.jobs, *since, &self.config) };
-                for (title, body) in notes {
-                    notifier::notify(&title, &body, self.config.notify_sound);
-                }
+        // (only read when notifications are on: it's a file read and a copy of every job)
+        if self.config.notifications
+            && let Some((since, old)) = crate::background::load_seen(c.host())
+                .map(|(when, jobs)| (Some(when), jobs))
+                .or_else(|| c.jobs.clone().map(|jobs| (None, jobs)))
+        {
+            let notes = if c.source.is_runpod() {
+                crate::runpod::changes(c.host(), &old, &snap.jobs, &self.config)
+            } else { job_changes(c.host(), &old, &snap.jobs, since, &self.config) };
+            for (title, body) in notes {
+                notifier::notify(&title, &body, self.config.notify_sound);
             }
         }
         crate::background::save_seen(c.host(), &snap.jobs);
@@ -403,6 +430,8 @@ impl App {
             }
         }
         if c.source.is_runpod() { c.loading = false; }
+        // forget the temperature history of jobs that dropped off the list, so it doesn't grow forever
+        self.temp_history.retain(|(ci, id), _| *ci != i || snap.jobs.iter().any(|j| &j.id == id));
         c.jobs = Some(snap.jobs);
         c.fetched = Some(Instant::now());
         c.error = None;
@@ -510,7 +539,7 @@ impl App {
 
     pub fn selected_job(&self) -> Option<(usize, &Cluster, &Job)> {
         let (ci, id) = self.selected.as_ref()?;
-        let c = &self.clusters[*ci];
+        let c = self.clusters.get(*ci)?;
         Some((*ci, c, c.jobs.as_ref()?.iter().find(|j| &j.id == id)?))
     }
 
@@ -533,6 +562,7 @@ impl App {
             fetched: Instant::now(),
             fetched_running: false,
             top: None,
+            request: 0,
         });
         self.fetch_log();
     }
@@ -543,6 +573,8 @@ impl App {
             v.log = None;
             v.error = None;
             v.top = None;
+            // a fetch of the other stream may be in flight; its reply is dropped, so start a new one
+            v.loading = false;
         }
         self.fetch_log();
     }
@@ -557,6 +589,9 @@ impl App {
             return;
         }
         v.loading = true;
+        self.log_requests += 1;
+        v.request = self.log_requests;
+        let request = v.request;
         let c = &self.clusters[v.ci];
         let (out, err) = c.outputs.get(&v.id).cloned().unwrap_or_default();
         let pattern = if v.stderr { err } else { out };
@@ -567,12 +602,12 @@ impl App {
         let known = v.log.as_ref().filter(|_| skip_unchanged && v.fetched_running)
             .map(|log| (log.path.clone(), log.stamp.clone()));
         thread::spawn(move || {
-            let request = remote::LogRequest {
+            let log_request = remote::LogRequest {
                 id: &id, name: &name, workdir: &workdir, pattern: &pattern, stderr,
                 known: known.as_ref().map(|(path, stamp)| (path.as_str(), stamp.as_str())),
             };
-            let r = remote::fetch_log(&host, &request);
-            let _ = tx.send(Msg::Log(id, stderr, r));
+            let r = guarded(|| remote::fetch_log(&host, &log_request));
+            let _ = tx.send(Msg::Log(request, r));
         });
     }
 
@@ -634,7 +669,7 @@ impl App {
         self.say(format!("requesting {} for {id}…", action.verb()), false);
         let tx = self.tx.clone();
         thread::spawn(move || {
-            let result = crate::runpod::act(&id, action);
+            let result = guarded(|| crate::runpod::act(&id, action));
             let _ = tx.send(Msg::PodAction(id, action, result));
         });
     }
@@ -643,7 +678,7 @@ impl App {
         let (tx, host) = (self.tx.clone(), self.clusters[ci].host().to_string());
         self.say(format!("cancelling {id}…"), false);
         thread::spawn(move || {
-            let r = remote::cancel(&host, &id);
+            let r = guarded(|| remote::cancel(&host, &id));
             let _ = tx.send(Msg::Cancelled(id, r));
         });
     }
@@ -711,6 +746,7 @@ impl App {
             Cmd::Filter => self.filtering = true,
             Cmd::Interval(s) => {
                 c.refresh_seconds = s;
+                self.refresh_override = None;
                 self.save(format!("refreshing every {}", crate::palette::interval_text(s)));
             }
             Cmd::Ended(e) => {
@@ -797,8 +833,19 @@ impl App {
                 match crate::theme::folder() {
                     Some(dir) => {
                         let _ = std::fs::create_dir_all(&dir);
-                        let _ = std::process::Command::new("open").arg(&dir).status();
-                        self.say("opened the themes folder", false);
+                        // no inherited output: anything `open` prints would land on top of the dashboard
+                        let opened = std::process::Command::new("open")
+                            .arg(&dir)
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .status()
+                            .is_ok_and(|s| s.success());
+                        if opened {
+                            self.say("opened the themes folder", false);
+                        } else {
+                            self.say(format!("couldn't open {}", dir.display()), true);
+                        }
                     }
                     None => self.say("no config folder", true),
                 }
@@ -974,6 +1021,17 @@ pub fn job_changes(
     out
 }
 
+/// Run background work so a panic (e.g. on odd remote output) becomes an error message: the
+/// cluster or log stops loading and shows it, instead of waiting forever for a reply.
+fn guarded<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|panic| {
+        let why = panic.downcast_ref::<&str>().copied()
+            .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("unknown error");
+        Err(format!("internal error: {why}"))
+    })
+}
+
 /// "sweep-lr, eval-big, probe +2" for a group notification.
 fn names(jobs: &[&Job]) -> String {
     let mut names: Vec<&str> = jobs.iter().map(|j| j.name.as_str()).collect();
@@ -987,7 +1045,9 @@ fn names(jobs: &[&Job]) -> String {
 
 fn cache_file(host: &str) -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".cache/gpudash").join(format!("{host}.tsv")))
+    // the host goes into a file name: keep a "/" in it from reaching outside the cache folder
+    let safe: String = host.chars().map(|c| if c.is_ascii_alphanumeric() || "._-@".contains(c) { c } else { '_' }).collect();
+    Some(PathBuf::from(home).join(".cache/gpudash").join(format!("{safe}.tsv")))
 }
 
 fn load_outputs(host: &str) -> HashMap<String, (String, String)> {
@@ -1136,9 +1196,9 @@ mod tests {
             ci: 0, id: "42".into(), name: "train".into(), stderr: false,
             log: Some(Log { path: "train.log".into(), size: 4, lines: vec!["old".into()], stamp: "stamp".into() }),
             error: Some("previous error".into()), loading: true,
-            fetched: Instant::now() - LOG_REFRESH, fetched_running: true, top: Some(0),
+            fetched: Instant::now() - LOG_REFRESH, fetched_running: true, top: Some(0), request: 7,
         });
-        app.tx.send(Msg::Log("42".into(), false, Ok(None))).unwrap();
+        app.tx.send(Msg::Log(7, Ok(None))).unwrap();
         app.receive();
         let view = app.log.as_ref().unwrap();
         assert_eq!(view.log.as_ref().unwrap().lines, ["old"]);
@@ -1146,6 +1206,33 @@ mod tests {
         assert!(!view.loading);
         assert!(view.error.is_none());
         assert!(view.fetched.elapsed() < LOG_REFRESH);
+    }
+
+    #[test]
+    fn log_replies_for_older_requests_are_dropped() {
+        let mut app = App::new(Config::default(), Vec::new());
+        app.clusters.extend([test_cluster(0), test_cluster(1)]);
+        let log = |line: &str| Log { path: "x.log".into(), size: 1, lines: vec![line.into()], stamp: String::new() };
+        // same job id on another cluster (or the other stream): only the current request may land
+        app.log = Some(LogView {
+            ci: 1, id: "42".into(), name: "train".into(), stderr: false, log: None, error: None, loading: true,
+            fetched: Instant::now(), fetched_running: false, top: None, request: 2,
+        });
+        app.tx.send(Msg::Log(1, Ok(Some(log("other cluster"))))).unwrap();
+        app.receive();
+        let view = app.log.as_ref().unwrap();
+        assert!(view.log.is_none() && view.loading, "a stale reply must not end the current fetch");
+        app.tx.send(Msg::Log(2, Ok(Some(log("this one"))))).unwrap();
+        app.receive();
+        let view = app.log.as_ref().unwrap();
+        assert_eq!(view.log.as_ref().unwrap().lines, ["this one"]);
+        assert!(!view.loading);
+    }
+
+    #[test]
+    fn worker_panics_become_errors() {
+        let r: Result<(), String> = guarded(|| panic!("bad line {}", 3));
+        assert_eq!(r, Err("internal error: bad line 3".into()));
     }
 
     #[test]

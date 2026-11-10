@@ -20,6 +20,7 @@ use ratatui::crossterm::event::{
     MouseEventKind,
 };
 use ratatui::crossterm::execute;
+use ratatui::crossterm::terminal::EnterAlternateScreen;
 
 use app::{App, Next, Popup};
 use palette::{Act, Palette};
@@ -67,7 +68,12 @@ fn main() -> std::io::Result<()> {
                 print!("{HELP}");
                 return Ok(());
             }
-            "-n" => interval = args.next().and_then(|s| s.parse().ok()),
+            // the dashboard never polls more often than every 5 s (App::interval)
+            "-n" => match args.next().and_then(|s| s.parse::<u64>().ok()) {
+                Some(n) if n >= 5 => interval = Some(n),
+                _ => usage_error("-n needs a whole number of seconds, 5 or more"),
+            },
+            s if s.starts_with('-') => usage_error(&format!("unknown option {s}")),
             _ => hosts.push(a),
         }
     }
@@ -88,6 +94,7 @@ fn main() -> std::io::Result<()> {
     theme::write_examples();
     let theme_error = theme::apply(&config.theme).err();
     let mut app = App::new(config, hosts);
+    app.refresh_override = interval;
     app.theme_shown = app.config.theme.clone();
     if let Some(e) = theme_error {
         app.say(e, true);
@@ -96,6 +103,11 @@ fn main() -> std::io::Result<()> {
     // if gpudash ever crashes, give the terminal its mouse back (ratatui's own hook does the rest)
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // Background fetches turn their panics into error messages (app::guarded). Restoring the
+        // terminal or printing from one would leave the still-running dashboard on a broken screen.
+        if std::thread::current().name() != Some("main") {
+            return;
+        }
         let _ = execute!(std::io::stdout(), DisableMouseCapture);
         previous(info);
     }));
@@ -116,11 +128,18 @@ fn main() -> std::io::Result<()> {
 
 /// `gpudash background on|off|status`
 fn background_command(what: Option<&str>) -> std::io::Result<()> {
-    let (mut config, _) = config::load();
+    let (mut config, err) = config::load();
+    if let (Some(e), Some("on" | "off")) = (&err, what) {
+        // saving the defaults we got instead would wipe the clusters in the file
+        eprintln!("gpudash: couldn't read the config file, so it was left as it is\n  {e}");
+        std::process::exit(1);
+    }
     match what {
         Some("on") => {
             config.background = true;
-            let _ = config::save(&config);
+            if let Err(e) = config::save(&config) {
+                eprintln!("gpudash: couldn't save the config file: {e}");
+            }
             match background::ensure() {
                 Ok(_) => println!("background notifications on"),
                 Err(e) => println!("couldn't turn on background notifications: {e}"),
@@ -128,7 +147,9 @@ fn background_command(what: Option<&str>) -> std::io::Result<()> {
         }
         Some("off") => {
             config.background = false;
-            let _ = config::save(&config);
+            if let Err(e) = config::save(&config) {
+                eprintln!("gpudash: couldn't save the config file: {e}");
+            }
             background::remove();
             println!("background notifications off");
         }
@@ -136,6 +157,11 @@ fn background_command(what: Option<&str>) -> std::io::Result<()> {
         Some(other) => println!("unknown option \"{other}\": use on, off or status"),
     }
     Ok(())
+}
+
+fn usage_error(msg: &str) -> ! {
+    eprint!("gpudash: {msg}\n\n{HELP}");
+    std::process::exit(2);
 }
 
 /// Full-screen mode with mouse capture, so scroll-wheel events arrive as scrolling
@@ -151,22 +177,39 @@ fn restore_terminal() {
     ratatui::restore();
 }
 
+/// Time between frames: how often spinners move and finished fetches get picked up.
+const FRAME: Duration = Duration::from_millis(80);
+
 fn run(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
+    let mut targets = ui::MouseTargets::default();
+    let mut drawn: Option<Instant> = None;
+    let mut dirty = true;
     loop {
-        app.receive();
-        let mut targets = ui::MouseTargets::default();
-        terminal.draw(|f| targets = ui::draw(f, app))?;
+        dirty |= app.receive();
+        // Spinners move every frame; otherwise only a change, or the per-second counters
+        // ("updated 12s ago", the refresh countdown), needs a redraw.
+        let animating = app.loading() || app.log.as_ref().is_some_and(|v| v.loading);
+        if dirty || animating || drawn.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
+            terminal.draw(|f| targets = ui::draw(f, app))?;
+            drawn = Some(Instant::now());
+            dirty = false;
+        }
         // handle everything that's waiting, so fast scrolling or typing never lags behind
-        let mut wait = Duration::from_millis(80);
-        let mut stale = false;
-        while event::poll(wait)? {
-            wait = Duration::ZERO;
+        let frame_end = Instant::now() + FRAME;
+        let mut handled = false;
+        while event::poll(if handled { Duration::ZERO } else { frame_end.saturating_duration_since(Instant::now()) })? {
             let ev = event::read()?;
+            // mouse capture reports every pointer move; they change nothing, so they neither redraw
+            // nor end the frame early (which would speed up the spinner and the heartbeat count)
+            if matches!(&ev, Event::Mouse(m) if m.kind == MouseEventKind::Moved) {
+                continue;
+            }
+            handled = true;
             // an earlier event may have changed the layout, so redraw before hit-testing a click
-            if stale && matches!(&ev, Event::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Left)) {
+            if dirty && matches!(&ev, Event::Mouse(m) if m.kind == MouseEventKind::Down(MouseButton::Left)) {
                 terminal.draw(|f| targets = ui::draw(f, app))?;
             }
-            stale = true;
+            dirty = true;
             let next = match ev {
                 Event::Key(k) if k.kind == KeyEventKind::Press => on_key(app, k),
                 Event::Mouse(m) => on_mouse(app, m, &targets),
@@ -176,29 +219,35 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
                 Next::Continue => {}
                 Next::Quit => return Ok(()),
                 Next::Shell { host, workdir, running_id } => {
-                    suspend(terminal, || {
-                        println!("\n  gpudash → {host}:{workdir}  (exit the shell to come back)\n");
+                    let result = suspend(terminal, || {
+                        // the folder comes from the remote host: never print its control characters raw
+                        let shown: String = format!("{host}:{workdir}").chars().filter(|c| !c.is_control()).collect();
+                        println!("\n  gpudash → {shown}  (exit the shell to come back)\n");
                         remote::shell(&host, &workdir, running_id.as_deref())
                     })?;
+                    if let Err(e) = result {
+                        app.say(format!("couldn't start ssh: {e}"), true);
+                    }
                 }
                 Next::PodShell(endpoint) => {
-                    suspend(terminal, || {
+                    let result = suspend(terminal, || {
                         println!("\n  gpudash → {}@{}:{}  (exit the shell to come back)\n", endpoint.username, endpoint.host, endpoint.port);
-                        if let Err(e) = endpoint.connect() {
-                            app.say(e.to_string(), true);
-                        }
-                        Ok(())
+                        endpoint.connect()
                     })?;
+                    if let Err(e) = result {
+                        app.say(e.to_string(), true);
+                    }
                 }
                 Next::EditConfig => {
                     let Some(path) = config::path() else { continue };
                     if !path.exists() {
-                        let _ = config::save(&app.config);
+                        // through App::save, so a `-n` interval or command-line hosts don't end up in the file
+                        app.save("created the config file");
                     }
                     let editor = std::env::var("VISUAL")
                         .or_else(|_| std::env::var("EDITOR"))
                         .unwrap_or_else(|_| "vi".into());
-                    suspend(terminal, || {
+                    let result = suspend(terminal, || {
                         // $EDITOR may carry flags, e.g. "code --wait"
                         std::process::Command::new("sh")
                             .arg("-c")
@@ -206,13 +255,17 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
                             .arg("sh")
                             .arg(&path)
                             .status()
-                            .map(|_| ())
                     })?;
                     app.reload_config();
+                    match result {
+                        Ok(s) if s.success() => {}
+                        Ok(s) => app.say(format!("editor \"{editor}\" failed ({s})"), true),
+                        Err(e) => app.say(format!("couldn't run the editor: {e}"), true),
+                    }
                 }
             }
-}
-        if app.tick % 100 == 0 {
+        }
+        if app.tick.is_multiple_of(100) {
             // about every 8s: tell the background daemon the dashboard is open
             background::heartbeat();
         }
@@ -224,15 +277,15 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
 }
 
 /// Leave the full-screen view, run something in the normal terminal, then come back.
-fn suspend(terminal: &mut DefaultTerminal, f: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
+/// Returns what `f` returned, to report once the dashboard is back on screen.
+fn suspend<T>(terminal: &mut DefaultTerminal, f: impl FnOnce() -> T) -> std::io::Result<T> {
     restore_terminal();
     let result = f();
-    *terminal = init_terminal();
+    // not ratatui::init again: that would stack another panic hook on every visit
+    ratatui::crossterm::terminal::enable_raw_mode()?;
+    execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
     terminal.clear()?;
-    if let Err(e) = result {
-        eprintln!("{e}");
-    }
-    Ok(())
+    Ok(result)
 }
 
 /// Shortest time between two rows when scrolling a list with the wheel.

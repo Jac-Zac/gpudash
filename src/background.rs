@@ -41,7 +41,10 @@ struct Seen {
 }
 
 fn seen_path(host: &str) -> Option<PathBuf> {
-    cache_dir().map(|d| d.join(format!("seen-{host}.json")))
+    // the host goes into a file name: keep a "/" in it from reaching outside the cache folder
+    let safe: String =
+        host.chars().map(|c| if c.is_ascii_alphanumeric() || "._-@".contains(c) { c } else { '_' }).collect();
+    cache_dir().map(|d| d.join(format!("seen-{safe}.json")))
 }
 
 /// The jobs last seen on `host` and when, unless that's too old to compare against.
@@ -57,10 +60,11 @@ pub fn save_seen(host: &str, jobs: &[Job]) {
     let _ = std::fs::create_dir_all(path.parent().unwrap());
     let seen = Seen { saved: Utc::now(), jobs: jobs.to_vec() };
     if let Ok(text) = serde_json::to_string(&seen) {
-        // write then rename, so a reader never sees half a file
-        let tmp = path.with_extension("json.tmp");
-        if std::fs::write(&tmp, text).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
+        // write then rename, so a reader never sees half a file; the temp name is per process
+        // so two writers (dashboard and daemon) can't interleave into one temp file
+        let tmp = path.with_extension(format!("json.tmp{}", std::process::id()));
+        if std::fs::write(&tmp, text).is_err() || std::fs::rename(&tmp, &path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
         }
     }
 }
@@ -78,9 +82,12 @@ pub fn heartbeat() {
     let _ = std::fs::write(path, std::process::id().to_string());
 }
 
-/// Called when the dashboard quits, so the daemon takes over right away.
+/// Called when the dashboard quits, so the daemon takes over right away. Leaves the file alone
+/// if another open dashboard wrote it last, so the daemon doesn't start polling under it.
 pub fn heartbeat_stop() {
-    if let Some(path) = heartbeat_path() {
+    if let Some(path) = heartbeat_path()
+        && std::fs::read_to_string(&path).is_ok_and(|pid| pid == std::process::id().to_string())
+    {
         let _ = std::fs::remove_file(path);
     }
 }
@@ -177,7 +184,7 @@ fn log_path() -> Option<PathBuf> {
 }
 
 fn uid() -> String {
-    Command::new("id")
+    Command::new("/usr/bin/id")
         .arg("-u")
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
@@ -185,7 +192,7 @@ fn uid() -> String {
 }
 
 fn launchctl(args: &[&str]) -> bool {
-    Command::new("launchctl")
+    Command::new("/bin/launchctl")
         .args(args)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -261,9 +268,26 @@ pub fn ensure() -> Result<bool, String> {
         }
         std::fs::create_dir_all(plist_file.parent().unwrap()).map_err(|e| e.to_string())?;
         let _ = std::fs::create_dir_all(log.parent().unwrap());
-        std::fs::write(&plist_file, &want).map_err(|e| e.to_string())?;
+        // write then rename, so launchd never loads half a plist
+        let tmp = plist_file.with_extension(format!("plist.tmp{}", std::process::id()));
+        std::fs::write(&tmp, &want)
+            .and_then(|()| std::fs::rename(&tmp, &plist_file))
+            .map_err(|e| {
+                let _ = std::fs::remove_file(&tmp);
+                e.to_string()
+            })?;
     }
-    if !running() && !launchctl(&["bootstrap", &domain, &plist_file.display().to_string()]) {
+    // right after a bootout, launchd may still be tearing the old service down and refuse
+    // the bootstrap for a moment, so give it a few tries
+    let bootstrap = || {
+        (0..5).any(|attempt| {
+            if attempt > 0 {
+                thread::sleep(Duration::from_millis(300));
+            }
+            launchctl(&["bootstrap", &domain, &plist_file.display().to_string()])
+        })
+    };
+    if !running() && !bootstrap() {
         return Err("couldn't start the background service (launchctl bootstrap failed)".into());
     }
     // after an update, restart the daemon so it runs the new build

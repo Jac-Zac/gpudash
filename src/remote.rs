@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::util::*;
 
-const CONTROL_PATH: &str = "ControlPath=~/.ssh/cm-%r@%h:%p";
+// %C is a fixed-length hash of user, host and port: a long host name can't push the socket path
+// past the Unix socket limit (104 bytes on macOS), which makes ssh refuse to run at all.
+const CONTROL_PATH: &str = "ControlPath=~/.ssh/cm-%C";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Gpu {
@@ -46,7 +48,7 @@ impl Job {
     pub fn pod_ssh(&self) -> Option<&crate::runpod::SshEndpoint> {
         if !self.running() { return None; }
         let ssh = self.pod.as_ref()?.ssh.as_ref()?;
-        ssh.proxy.as_ref().or(ssh.direct.as_ref())
+        ssh.proxy.as_ref().filter(|e| e.plain()).or(ssh.direct.as_ref().filter(|e| e.plain()))
     }
 
     pub fn running(&self) -> bool {
@@ -84,7 +86,11 @@ sacct -X -n -P -S now-24hours \
   -o JobID,JobName,State,Elapsed,Timelimit,End,ExitCode,WorkDir,AllocTRES,NodeList,Partition 2>/dev/null \
   | sed 's/^/@@DONE|/' > "$t/done" &
 squeue -u "$USER" -h -O 'JobID:|,STDOUT:|,STDERR:' 2>/dev/null | sed 's/^/@@OUT|/' > "$t/out" &
-jobs=$(squeue -u "$USER" -h -o '@@JOB|%i|%j|%T|%M|%l|%b|%N|%S|%Z|%r|%P')
+# a failed squeue must not look like an empty queue (every job would "leave the queue")
+if ! jobs=$(squeue -u "$USER" -h -o '@@JOB|%i|%j|%T|%M|%l|%b|%N|%S|%Z|%r|%P' 2>&1); then
+  echo "@@FAIL|$(printf '%s\n' "$jobs" | tail -n 1)"
+  jobs=
+fi
 printf '%s\n' "$jobs"
 wait
 cat "$t"/* 2>/dev/null
@@ -170,14 +176,17 @@ fn run(host: &str, script: &str) -> Result<String, String> {
             "-o", "ServerAliveInterval=15",
             "-o", "ServerAliveCountMax=3",
             "-o", CONTROL_PATH,
-            host, "bash -s",
+            // a host from the config is never read as an option (e.g. "-oProxyCommand=…")
+            "--", host, "bash -s",
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| e.to_string())?;
-    child.stdin.take().unwrap().write_all(script.as_bytes()).map_err(|e| e.to_string())?;
+    // If ssh already quit (bad host, auth failure), this fails with a broken pipe; carry on, so the
+    // child is still reaped and ssh's own error is reported below.
+    let _ = child.stdin.take().unwrap().write_all(script.as_bytes());
     // read both pipes on their own threads so a full pipe can't stall the process
     let read = |mut r: Box<dyn Read + Send>| {
         thread::spawn(move || {
@@ -200,7 +209,7 @@ fn run(host: &str, script: &str) -> Result<String, String> {
 }
 
 fn last_line(s: &str) -> Option<&str> {
-    s.lines().map(str::trim).filter(|l| !l.is_empty()).last()
+    s.lines().map(str::trim).rfind(|l| !l.is_empty())
 }
 
 fn parse_time(s: &str, tz: FixedOffset) -> Option<DateTime<Utc>> {
@@ -211,14 +220,27 @@ fn parse_time(s: &str, tz: FixedOffset) -> Option<DateTime<Utc>> {
 }
 
 pub fn fetch_jobs(host: &str) -> Result<Snapshot, String> {
-    let out = run(host, JOBS_SCRIPT)?;
+    parse_jobs(&run(host, JOBS_SCRIPT)?)
+}
+
+fn parse_jobs(out: &str) -> Result<Snapshot, String> {
     let mut tz = FixedOffset::east_opt(0).unwrap();
     let mut active: Vec<Job> = Vec::new();
     let mut done: Vec<Job> = Vec::new();
     let mut outputs = HashMap::new();
 
     for line in out.lines().filter(|l| l.starts_with("@@")) {
-        let f: Vec<&str> = line.split('|').collect();
+        if let Some(e) = line.strip_prefix("@@FAIL|") {
+            return Err(if e.trim().is_empty() { "squeue failed".into() } else { e.trim().to_string() });
+        }
+        let name: String;
+        let mut f: Vec<&str> = line.split('|').collect();
+        // A job name may contain '|'. The 9 fields after it don't, so fold any extras back into the name.
+        if matches!(f[0], "@@JOB" | "@@DONE") && f.len() > 12 {
+            let extra = f.len() - 12;
+            name = f[2..=2 + extra].join("|");
+            f.splice(2..=2 + extra, [name.as_str()]);
+        }
         match f[0] {
             "@@NOW" if f.len() >= 3 => tz = parse_offset(f[2]).unwrap_or(tz),
             "@@JOB" if f.len() >= 12 => active.push(Job {
@@ -358,7 +380,8 @@ else
   else
     echo "@@STAMP|$stamp"
     echo "@@SIZE|${{stamp%%|*}}"
-    tail -n 3000 "$p"
+    # cap the bytes too: progress bars redraw with \r, so one "line" can hold the whole file
+    tail -c 2000000 "$p" | tail -n 3000
   fi
 fi
 "#,
@@ -406,22 +429,26 @@ pub fn cancel(host: &str, id: &str) -> Result<(), String> {
     if out.contains("@@OK") {
         Ok(())
     } else {
-        let msg = out.lines().filter(|l| !l.starts_with("@@")).map(str::trim).filter(|l| !l.is_empty()).last();
+        let msg = out.lines().filter(|l| !l.starts_with("@@")).map(str::trim).rfind(|l| !l.is_empty());
         Err(msg.unwrap_or("scancel failed").to_string())
     }
 }
 
-/// Interactive shell: inside the job's allocation if it's running, else in its folder on the login node.
 /// Close the shared ssh connection, so the next poll logs in fresh.
 pub fn disconnect(host: &str) {
-    let _ = Command::new("ssh")
-        .args(["-o", CONTROL_PATH, "-O", "exit", host])
+    // Runs on the UI thread, and a wedged master can leave `-O exit` waiting forever.
+    if let Ok(mut child) = Command::new("ssh")
+        .args(["-o", CONTROL_PATH, "-O", "exit", "--", host])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status();
+        .spawn()
+    {
+        wait_limit(&mut child, Duration::from_secs(3));
+    }
 }
 
+/// Interactive shell: inside the job's allocation if it's running, else in its folder on the login node.
 pub fn shell(host: &str, workdir: &str, running_id: Option<&str>) -> std::io::Result<()> {
     let cd = format!("cd {} 2>/dev/null", sh_quote(workdir));
     let remote = match running_id {
@@ -429,7 +456,7 @@ pub fn shell(host: &str, workdir: &str, running_id: Option<&str>) -> std::io::Re
         None => format!("{cd}; exec bash -l"),
     };
     Command::new("ssh")
-        .args(["-t", "-o", "ControlMaster=no", "-o", CONTROL_PATH, host, &remote])
+        .args(["-t", "-o", "ControlMaster=no", "-o", CONTROL_PATH, "--", host, &remote])
         .status()
         .map(|_| ())
 }
@@ -502,6 +529,25 @@ srun() {{ echo UNEXPECTED; }}
 {JOBS_SCRIPT}"#));
         assert!(!out.contains("UNEXPECTED"));
         assert!(out.contains("@@JOB|42|"));
+    }
+
+    #[test]
+    fn failed_squeue_is_an_error_not_an_empty_queue() {
+        let out = bash(&format!(r#"
+squeue() {{ case "$*" in *STDOUT*) ;; *) echo 'slurm_load_jobs error: Socket timed out on send/recv operation' >&2; return 1;; esac; }}
+sacct() {{ :; }}
+{JOBS_SCRIPT}"#));
+        assert_eq!(parse_jobs(&out).err().unwrap(), "slurm_load_jobs error: Socket timed out on send/recv operation");
+    }
+
+    #[test]
+    fn job_names_may_contain_the_field_separator() {
+        let out = "@@NOW|0|+0000\n\
+                   @@JOB|42|a|b|c|RUNNING|1:00|1:00:00|gpu:h200:1|node1|2026-10-30T12:00:00|/tmp|None|gpu\n\
+                   @@DONE|41|x|y|COMPLETED|1:00|1:00:00|2026-10-30T11:00:00|0:0|/tmp|gres/gpu:h200=1|node2|gpu";
+        let jobs = parse_jobs(out).unwrap().jobs;
+        assert_eq!((jobs[0].name.as_str(), jobs[0].state.as_str(), jobs[0].partition.as_str()), ("a|b|c", "RUNNING", "gpu"));
+        assert_eq!((jobs[1].name.as_str(), jobs[1].state.as_str(), jobs[1].nodes.as_str()), ("x|y", "COMPLETED", "node2"));
     }
 
     #[test]

@@ -22,24 +22,25 @@ pub fn notify_blocking(title: &str, body: &str, sound: bool) {
 }
 
 fn osascript(title: &str, body: &str, sound: bool) {
-    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
-    let mut script = format!("display notification \"{}\" with title \"{}\"", esc(body), esc(title));
+    // the text goes in as arguments, never into the script itself
+    let mut script = "display notification (item 2 of argv) with title (item 1 of argv)".to_string();
     if sound {
         script += " sound name \"Glass\"";
     }
-    let _ = Command::new("osascript")
-        .args(["-e", &script])
+    // wait for it, so it doesn't linger as a zombie in the dashboard or the daemon
+    let _ = Command::new("/usr/bin/osascript")
+        .args(["-e", "on run argv", "-e", &script, "-e", "end run", "--", title, body])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn();
+        .status();
 }
 
 #[cfg(notifier)]
 mod bundle {
     use std::hash::{DefaultHasher, Hash, Hasher};
     use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::sync::OnceLock;
 
@@ -64,19 +65,18 @@ mod bundle {
         let app = PathBuf::from(home).join("Library/Application Support/gpudash/gpudash.app");
         let stamp = app.with_file_name("gpudash.app.version");
         let version = version();
-        if std::fs::read_to_string(&stamp).is_ok_and(|v| v == version) {
+        let contents = app.join("Contents");
+        let exe = contents.join("MacOS/gpudash-notify");
+        if exe.is_file() && std::fs::read_to_string(&stamp).is_ok_and(|v| v == version) {
             return Ok(app);
         }
-        let contents = app.join("Contents");
         std::fs::create_dir_all(contents.join("MacOS"))?;
         std::fs::create_dir_all(contents.join("Resources"))?;
-        let exe = contents.join("MacOS/gpudash-notify");
-        std::fs::write(&exe, BIN)?;
-        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755))?;
-        std::fs::write(contents.join("Info.plist"), PLIST)?;
-        std::fs::write(contents.join("Resources/gpudash.icns"), ICON)?;
+        write_new(&exe, BIN, 0o755)?;
+        write_new(&contents.join("Info.plist"), PLIST, 0o644)?;
+        write_new(&contents.join("Resources/gpudash.icns"), ICON, 0o644)?;
         // macOS wants app bundles signed; an ad-hoc signature is enough on your own machine
-        let signed = Command::new("codesign")
+        let signed = Command::new("/usr/bin/codesign")
             .args(["--force", "--sign", "-"])
             .arg(&app)
             .stdout(Stdio::null())
@@ -87,6 +87,18 @@ mod bundle {
         }
         std::fs::write(&stamp, version)?;
         Ok(app)
+    }
+
+    /// Write a new file and rename it over `path`. Rewriting a signed binary in place (which
+    /// another gpudash may be running) gets it killed by macOS; this swaps in a fresh file.
+    /// The temp name is per process, so the dashboard and the daemon can't clobber each other.
+    fn write_new(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
+        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+        std::fs::write(&tmp, bytes)?;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+        std::fs::rename(&tmp, path).inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
     }
 
     /// Run the helper directly, which hands it the text reliably. Until macOS knows the app
@@ -103,7 +115,7 @@ mod bundle {
             .status();
         match direct.map(|s| s.code()) {
             Ok(Some(0)) => true,
-            Ok(Some(2)) => Command::new("open")
+            Ok(Some(2)) => Command::new("/usr/bin/open")
                 .args(["-g", "-n"])
                 .arg(app)
                 .arg("--args")

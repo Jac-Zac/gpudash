@@ -137,9 +137,11 @@ const HEADER: &str = "\
 ";
 
 fn dir() -> Option<PathBuf> {
+    // an empty or relative value would put the config under the current folder; ignore it (XDG spec)
+    let absolute = |v: std::ffi::OsString| Some(PathBuf::from(v)).filter(|p| p.is_absolute());
     let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+        .and_then(absolute)
+        .or_else(|| std::env::var_os("HOME").and_then(absolute).map(|h| h.join(".config")))?;
     Some(base.join("gpudash"))
 }
 
@@ -147,20 +149,24 @@ pub fn path() -> Option<PathBuf> {
     dir().map(|d| d.join("config.toml"))
 }
 
+fn parse(path: &std::path::Path, text: &str) -> Result<Config, String> {
+    let c = toml::from_str::<Config>(text).map_err(|e| format!("{}: {}", path.display(), e.message()))?;
+    if c.clusters.iter().any(|c| c.provider == Provider::Slurm && c.host.trim().is_empty()) {
+        return Err("Slurm clusters need a host".into());
+    }
+    Ok(c)
+}
+
 /// Load the config. Errors are returned as text so they can be shown in the app.
 pub fn load() -> (Config, Option<String>) {
     let Some(path) = path() else { return (Config::default(), None) };
     match std::fs::read_to_string(&path) {
-        Ok(text) => match toml::from_str::<Config>(&text) {
-            Ok(c) => {
-                if c.clusters.iter().any(|c| c.provider == Provider::Slurm && c.host.trim().is_empty()) {
-                    return (Config::default(), Some("Slurm clusters need a host".into()));
-                }
-                (c, None)
-            }
-            Err(e) => (Config::default(), Some(format!("{}: {}", path.display(), e.message()))),
+        Ok(text) => match parse(&path, &text) {
+            Ok(c) => (c, None),
+            Err(e) => (Config::default(), Some(e)),
         },
-        Err(_) => (migrate_old().unwrap_or_default(), None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (migrate_old().unwrap_or_default(), None),
+        Err(e) => (Config::default(), Some(format!("{}: {e}", path.display()))),
     }
 }
 
@@ -189,10 +195,37 @@ fn migrate_old() -> Option<Config> {
 }
 
 pub fn save(config: &Config) -> Result<(), String> {
-    let path = path().ok_or("no home folder")?;
+    save_to(&path().ok_or("no home folder")?, config)
+}
+
+fn save_to(path: &std::path::Path, config: &Config) -> Result<(), String> {
+    // A file that doesn't load was most likely mid-edit by hand. The config in memory is then
+    // only the defaults, so writing it would throw away the user's clusters and settings.
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            parse(path, &text).map_err(|e| format!("not overwriting a config file with errors ({e})"))?;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    }
     std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
     let body = toml::to_string_pretty(config).map_err(|e| e.to_string())?;
-    std::fs::write(&path, format!("{HEADER}{body}")).map_err(|e| e.to_string())
+    // write a temporary file and rename it over the config, so a crash or full disk
+    // can't leave a half-written config behind. Follow a symlinked config (dotfiles) so the
+    // link itself stays in place.
+    let path = &std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let tmp = path.with_extension(format!("toml.{}.tmp", std::process::id()));
+    let write = || -> std::io::Result<()> {
+        std::fs::write(&tmp, format!("{HEADER}{body}"))?;
+        if let Ok(meta) = std::fs::metadata(path) {
+            std::fs::set_permissions(&tmp, meta.permissions())?;
+        }
+        std::fs::rename(&tmp, path)
+    };
+    write().map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        e.to_string()
+    })
 }
 
 #[cfg(test)]
@@ -211,6 +244,29 @@ mod tests {
         assert_eq!(back.clusters, c.clusters);
         assert_eq!(back.clock, ClockFormat::H24);
         assert!(text.contains("[[cluster]]"));
+    }
+
+    #[test]
+    fn save_replaces_good_files_and_keeps_broken_ones() {
+        let dir = std::env::temp_dir().join(format!("gpudash-config-test-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        let mine = Config { clusters: vec![ClusterConf { host: "explorer".into(), ..ClusterConf::default() }], ..Config::default() };
+        save_to(&path, &mine).unwrap();
+        assert_eq!(parse(&path, &std::fs::read_to_string(&path).unwrap()).unwrap().clusters, mine.clusters);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            save_to(&path, &mine).unwrap();
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        // a hand edit with a typo loads as defaults; saving those must not wipe the file
+        let broken = "refresh_seconds = \"oops\"\n[[cluster]]\nhost = \"explorer\"\n";
+        std::fs::write(&path, broken).unwrap();
+        assert!(save_to(&path, &Config::default()).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no temporary files left behind");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

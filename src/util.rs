@@ -131,10 +131,17 @@ pub fn slurm_secs(s: &str) -> Option<u64> {
         None => (0u64, s),
     };
     let mut parts: Vec<u64> = rest.split(':').map(|p| p.parse().ok()).collect::<Option<_>>()?;
+    if parts.len() > 3 {
+        return None;
+    }
     while parts.len() < 3 {
         parts.insert(0, 0);
     }
-    Some(days * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2])
+    // checked: the text comes from the remote host, and an absurd value shouldn't panic
+    days.checked_mul(86400)?
+        .checked_add(parts[0].checked_mul(3600)?)?
+        .checked_add(parts[1].checked_mul(60)?)?
+        .checked_add(parts[2])
 }
 
 pub fn dur(secs: Option<u64>) -> String {
@@ -236,20 +243,35 @@ pub fn clean_log_line(line: &str) -> String {
     let mut chars = line.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\x1b' {
-            if chars.peek() == Some(&'[') {
-                chars.next();
-                let mut seq = String::new();
-                for c in chars.by_ref() {
-                    if c.is_ascii_alphabetic() {
-                        if c == 'm' {
-                            out.push_str("\x1b[");
-                            out.push_str(&seq);
-                            out.push('m');
+            match chars.next() {
+                Some('[') => {
+                    let mut seq = String::new();
+                    for c in chars.by_ref() {
+                        if c.is_ascii_alphabetic() {
+                            if c == 'm' {
+                                out.push_str("\x1b[");
+                                out.push_str(&seq);
+                                out.push('m');
+                            }
+                            break;
                         }
-                        break;
+                        seq.push(c);
                     }
-                    seq.push(c);
                 }
+                // OSC (window title, hyperlink): runs to BEL or ESC \
+                Some(']') => {
+                    while let Some(c) = chars.next() {
+                        if c == '\x07' || (c == '\x1b' && chars.next_if_eq(&'\\').is_some()) {
+                            break;
+                        }
+                    }
+                }
+                // charset selection such as ESC ( B, which `tput sgr0` writes
+                Some('(' | ')' | '*' | '+') => {
+                    chars.next();
+                }
+                // any other two-character escape
+                _ => {}
             }
         } else if c == '\t' {
             out.push_str("    ");

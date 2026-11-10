@@ -101,7 +101,7 @@ fn tick(b: bool) -> &'static str {
 }
 
 pub fn interval_text(secs: u64) -> String {
-    if secs % 60 == 0 { format!("{}m", secs / 60) } else { format!("{secs}s") }
+    if secs >= 60 && secs.is_multiple_of(60) { format!("{}m", secs / 60) } else { format!("{secs}s") }
 }
 
 pub fn ended_text(app: &App) -> String {

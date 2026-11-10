@@ -115,11 +115,22 @@ pub fn draw(f: &mut Frame, app: &App) -> MouseTargets {
             f.render_widget(Paragraph::new(lines).block(panel().padding(Padding::horizontal(1))), area);
         }
         Some(Popup::Help) => draw_help(f),
-        Some(Popup::ConfirmCancel { ci, id, name }) => draw_confirm(f, app.clusters[*ci].host(), id, name),
+        Some(Popup::ConfirmCancel { ci, id, name }) => {
+            draw_confirm(f, app.clusters.get(*ci).map_or("", |c| c.host()), id, name)
+        }
         None => {}
     }
     if let Some(p) = &app.palette {
         draw_palette(f, app, p, &mut targets);
+    }
+    // Text from remote hosts (job names, folders, ssh errors, pod names) reaches the buffer as is,
+    // and ratatui keeps control characters as zero-width text that the terminal would then run as
+    // escape sequences (set the title, write the clipboard, clear the screen). Drop them.
+    for cell in f.buffer_mut().content.iter_mut() {
+        if cell.symbol().contains(char::is_control) {
+            let clean: String = cell.symbol().chars().filter(|c| !c.is_control()).collect();
+            cell.set_symbol(if clean.is_empty() { " " } else { &clean });
+        }
     }
     targets
 }
@@ -176,9 +187,9 @@ fn draw_clusters(f: &mut Frame, area: Rect, app: &App, targets: &mut MouseTarget
     let visible: Vec<Vec<&Job>> = shown.iter().map(|&i| app.visible(&app.clusters[i])).collect();
     let heights: Vec<u16> = visible
         .iter()
-        .map(|v| if v.is_empty() { 3 } else { v.len() as u16 + 3 })
+        .map(|v| v.len().saturating_add(3).min(u16::MAX as usize) as u16)
         .collect();
-    let constraints: Vec<Constraint> = if heights.iter().sum::<u16>() <= area.height {
+    let constraints: Vec<Constraint> = if heights.iter().map(|&h| u32::from(h)).sum::<u32>() <= u32::from(area.height) {
         heights.iter().map(|&h| Constraint::Length(h)).chain([Constraint::Fill(1)]).collect()
     } else {
         heights.iter().map(|&h| Constraint::Fill(h)).collect()
@@ -259,10 +270,10 @@ fn draw_cluster(f: &mut Frame, area: Rect, app: &App, ci: usize, c: &Cluster, jo
         Constraint::Fill(1),
     ];
     let mut state = TableState::default();
-    if let Some((sci, id)) = &app.selected {
-        if *sci == ci {
-            state.select(jobs.iter().position(|j| &j.id == id));
-        }
+    if let Some((sci, id)) = &app.selected
+        && *sci == ci
+    {
+        state.select(jobs.iter().position(|j| &j.id == id));
     }
     let inner = block.inner(area);
     let table = Table::new(rows, widths)
@@ -400,6 +411,8 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
             let [left, right] = Layout::horizontal([Constraint::Fill(1), Constraint::Length(42)]).areas(area);
             area = left;
             let now = *h.last().unwrap();
+            // the sparkline draws from the start of the data, so keep only the newest polls that fit
+            let h = &h[h.len().saturating_sub(right.width.saturating_sub(2) as usize)..];
             // GPUs rarely sit below 20°, so start the scale there to make changes visible
             let shifted: Vec<u64> = h.iter().map(|t| t.saturating_sub(20)).collect();
             let spark = Sparkline::default()
@@ -510,23 +523,23 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
         ]);
         f.render_widget(Paragraph::new(Line::from(hints)), area);
     }
-    if let Some((msg, err, when)) = &app.toast {
-        if when.elapsed().as_secs() < TOAST_SECS {
-            let color = if *err { t().failed } else { t().running };
-            let line = Line::from(Span::styled(format!("{msg} "), Style::new().fg(color))).right_aligned();
-            f.render_widget(Paragraph::new(line), area);
-        }
+    if let Some((msg, err, when)) = &app.toast
+        && when.elapsed().as_secs() < TOAST_SECS
+    {
+        let color = if *err { t().failed } else { t().running };
+        let line = Line::from(Span::styled(format!("{msg} "), Style::new().fg(color))).right_aligned();
+        f.render_widget(Paragraph::new(line), area);
     }
 }
 
 fn draw_log(f: &mut Frame, app: &App, v: &LogView) {
     let area = f.area();
     clear(f, area);
-    let c = &app.clusters[v.ci];
+    let host = app.clusters.get(v.ci).map_or("", |c| c.host());
     let path = v.log.as_ref().map_or(String::new(), |l| format!("{} · {}", shorten(&l.path, 60), size(l.size)));
     let mut title = vec![
         Span::styled(format!(" {} ", v.name), Style::new().fg(t().text).bold()),
-        dim(format!("{} · {} · {} ", v.id, c.host(), if v.stderr { "stderr" } else { "stdout" })),
+        dim(format!("{} · {} · {} ", v.id, host, if v.stderr { "stderr" } else { "stdout" })),
     ];
     if v.loading {
         title.extend([spinner(app.tick), Span::raw(" ")]);
@@ -558,9 +571,17 @@ fn draw_log(f: &mut Frame, app: &App, v: &LogView) {
     } else if n == 0 {
         vec![Line::from(dim("(log is empty)"))]
     } else {
-        lines[top..(top + inner_h).min(n)].iter().map(|l| highlight::line(l)).collect()
+        lines[top..(top + inner_h).min(n)].iter().map(|l| highlight::line(log_head(l))).collect()
     };
     f.render_widget(Paragraph::new(body).block(block), area);
+}
+
+/// The start of a log line, enough to fill any terminal even with color codes. Lines aren't
+/// wrapped, so the rest is off screen anyway, and highlighting a megabyte-long line (a printed
+/// tensor, minified JSON) on every frame would freeze the view.
+fn log_head(line: &str) -> &str {
+    const MAX_CHARS: usize = 4096;
+    line.char_indices().nth(MAX_CHARS).map_or(line, |(i, _)| &line[..i])
 }
 
 fn size(bytes: u64) -> String {
@@ -689,17 +710,14 @@ fn draw_palette(f: &mut Frame, app: &App, p: &Palette, targets: &mut MouseTarget
         .map(|it| {
             let group = if it.group.is_empty() { String::new() } else { format!("{:<9}", it.group) };
             let arrow = if matches!(it.act, Act::Open(_)) { " ›" } else { "" };
-            let used = 1 + group.chars().count() + it.label.chars().count() + arrow.chars().count();
-            let hint = format!("{} ", it.hint);
-            let pad = width.saturating_sub(used + hint.chars().count());
             let hint_color = if it.hint == "on" || it.hint == "✓" { t().running } else { t().dim };
-            ListItem::new(Line::from(vec![
-                dim(format!(" {group}")),
-                text(it.label.clone()),
-                dim(arrow),
-                Span::raw(" ".repeat(pad)),
-                Span::styled(hint, Style::new().fg(hint_color)),
-            ]))
+            let hint = Span::styled(format!("{} ", it.hint), Style::new().fg(hint_color));
+            let mut spans = vec![dim(format!(" {group}")), text(it.label.clone()), dim(arrow)];
+            // display width, not chars, so wide characters (CJK host names) keep the hints aligned
+            let used: usize = spans.iter().map(Span::width).sum();
+            spans.push(Span::raw(" ".repeat(width.saturating_sub(used + hint.width()))));
+            spans.push(hint);
+            ListItem::new(Line::from(spans))
         })
         .collect();
     let mut state = ListState::default();
@@ -714,5 +732,83 @@ fn draw_palette(f: &mut Frame, app: &App, p: &Palette, targets: &mut MouseTarget
             Rect::new(list_area.x, list_area.y + row, list_area.width, 1),
             MouseTarget::Palette(state.offset() + row as usize),
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::remote::Gpu;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    fn job(id: &str, name: &str, state: &str) -> Job {
+        Job {
+            id: id.into(), name: name.into(), state: state.into(), used: Some(3600), limit: Some(7200),
+            gpu_label: "1× H200".into(), nodes: "node1".into(), start: None, end: None,
+            workdir: "/projects/me/実験/run".into(), reason: "Priority".into(), partition: "gpu".into(),
+            exit: "1:0".into(), gpus: Vec::new(), pod: None,
+        }
+    }
+
+    fn busy_app() -> App {
+        let mut app = App::new(Config::default(), vec!["alpha".into(), "βeta".into()]);
+        let mut run = job("1", "トレーニング🚀", "RUNNING");
+        run.gpus = (0..6).map(|i| Gpu { name: "H200".into(), temp: 40 + i * 10, util: 99, mem_used: 1000, mem_total: 0 }).collect();
+        let mut ended = job("2", "done", "FAILED");
+        ended.end = Some(chrono::Utc::now());
+        app.clusters[0].jobs = Some(vec![run, job("3", "wait", "PENDING"), ended]);
+        app.clusters[1].jobs = Some(Vec::new());
+        app.selected = Some((0, "1".into()));
+        app.temp_history.insert((0, "1".into()), (0..120).map(|i| 30 + i % 70).collect());
+        app
+    }
+
+    #[test]
+    fn tiny_and_odd_sizes_do_not_panic() {
+        let mut app = busy_app();
+        for state in 0..4 {
+            app.palette = None;
+            app.popup = None;
+            match state {
+                1 => app.popup = Some(Popup::Help),
+                2 => app.palette = Some(Palette::new()),
+                3 => app.popup = Some(Popup::ConfirmCancel { ci: 0, id: "1".into(), name: "x".into() }),
+                _ => {}
+            }
+            for (w, h) in (0..14).flat_map(|w| (0..14).map(move |h| (w, h))).chain([(200, 3), (3, 200), (130, 40), (1, 1)]) {
+                let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+                terminal.draw(|f| { draw(f, &app); }).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn remote_text_cannot_send_escape_sequences() {
+        let mut app = busy_app();
+        app.clusters[0].jobs.as_mut().unwrap()[0].name = "evil\x1b]52;c;cGF5bG9hZA==\x07\x1b[2J".into();
+        app.say("ssh: \x1b]0;pwned\x07 failed", true);
+        let mut terminal = Terminal::new(TestBackend::new(130, 40)).unwrap();
+        terminal.draw(|f| { draw(f, &app); }).unwrap();
+        let buf = terminal.backend().buffer();
+        assert!(buf.content.iter().all(|c| !c.symbol().contains(char::is_control)));
+        let screen: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(screen.contains("evil"));
+    }
+
+    #[test]
+    fn temperature_graph_shows_the_newest_polls() {
+        let mut app = busy_app();
+        // 120 polls: old ones cold, the last 40 hot
+        app.temp_history.insert((0, "1".into()), (0..120).map(|i| if i < 80 { 20 } else { 95 }).collect());
+        let mut terminal = Terminal::new(TestBackend::new(130, 40)).unwrap();
+        terminal.draw(|f| { draw(f, &app); }).unwrap();
+        let buf = terminal.backend().buffer();
+        // the graph's bottom row, just above the panel border: every column is drawn (hot), none blank
+        let (x0, x1) = (130 - 41, 130 - 1);
+        let y = (0..40).rev().find(|&y| buf[(x0 - 1, y)].symbol() == "╰").unwrap() - 1;
+        assert!((x0..x1).all(|x| buf[(x, y)].symbol() != " "), "the newest (hot) polls are the ones shown");
+        let screen: String = buf.content.iter().map(|c| c.symbol()).collect();
+        assert!(screen.contains("last 40 polls"));
     }
 }

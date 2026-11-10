@@ -88,6 +88,16 @@ pub struct SshEndpoint {
 }
 
 impl SshEndpoint {
+    /// Host and user come from the API. Only plain names reach ssh, where a user's ProxyCommand or
+    /// Match exec could expand them into a shell command (%h, %r), as in CVE-2023-51385.
+    pub fn plain(&self) -> bool {
+        let ok = |s: &str, extra: &[u8]| {
+            !s.is_empty() && !s.starts_with('-')
+                && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b) || extra.contains(&b))
+        };
+        ok(&self.host, b":") && ok(&self.username, b"")
+    }
+
     fn command(&self) -> Command {
         let mut cmd = Command::new("ssh");
         cmd.args(["-t", "-o", "ConnectTimeout=10", "-p", &self.port.to_string(), "-l", &self.username, "--", &self.host]);
@@ -95,6 +105,9 @@ impl SshEndpoint {
     }
 
     pub fn connect(&self) -> std::io::Result<()> {
+        if !self.plain() {
+            return Err(std::io::Error::other("Runpod sent an unexpected SSH host or user; not connecting"));
+        }
         // ssh passes on the remote shell's exit code; only 255 is ssh itself failing to connect
         match self.command().status()?.code() {
             Some(255) => Err(std::io::Error::other("SSH couldn't connect; check the pod's SSH setup and your registered key")),
@@ -556,6 +569,22 @@ pub(crate) mod tests {
         assert_eq!(command.get_program(), "ssh");
         let args: Vec<_> = command.get_args().map(|a| a.to_str().unwrap()).collect();
         assert_eq!(args, ["-t", "-o", "ConnectTimeout=10", "-p", "22", "-l", "pod-token", "--", "ssh.runpod.io"]);
+        assert!(endpoint.plain());
+        assert!(SshEndpoint { host: "2001:db8::1".into(), ..endpoint.clone() }.plain());
+
+        // Names that a ProxyCommand or Match exec could turn into shell commands are never used.
+        for (host, username) in [("$(touch x)", "root"), ("-oProxyCommand=x", "root"), ("h;x", "root"),
+                                 ("ssh.runpod.io", "a`x`"), ("ssh.runpod.io", "-x"), ("", "root")] {
+            let bad = SshEndpoint { host: host.into(), username: username.into(), ..endpoint.clone() };
+            assert!(!bad.plain(), "{host} {username}");
+            assert!(bad.connect().is_err());
+        }
+        let mut job = fixture().jobs.into_iter().find(|j| j.id == "running").unwrap();
+        let bad = SshEndpoint { host: "x;y".into(), ..endpoint.clone() };
+        job.pod.as_mut().unwrap().ssh = Some(PodSsh { proxy: Some(bad.clone()), direct: Some(endpoint) });
+        assert_eq!(job.pod_ssh().unwrap().host, "ssh.runpod.io", "falls back to the valid endpoint");
+        job.pod.as_mut().unwrap().ssh = Some(PodSsh { proxy: Some(bad), direct: None });
+        assert!(job.pod_ssh().is_none());
     }
 
     #[test]

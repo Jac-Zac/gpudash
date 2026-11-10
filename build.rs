@@ -19,18 +19,36 @@ fn main() {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|| "unknown commit".into());
     println!("cargo::rustc-env=GPUDASH_COMMIT={commit}");
-    println!("cargo::rerun-if-changed=.git/HEAD");
-    println!("cargo::rerun-if-changed=.git/refs/heads");
+    // only watch git files that exist: a missing path makes cargo rerun this script (and
+    // recompile the Swift helper) on every build, e.g. when built from a crates.io tarball
+    let git_paths = Command::new("git")
+        .args(["rev-parse", "--git-path", "HEAD", "--git-path", "refs/heads"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    for path in git_paths.lines().filter(|p| std::path::Path::new(p).exists()) {
+        println!("cargo::rerun-if-changed={path}");
+    }
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
     }
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("gpudash-notify");
+    // build for the target's architecture (not the host's), at the Info.plist's minimum macOS
+    let arch = match std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
+        Ok("aarch64") => "arm64".to_string(),
+        Ok(a) => a.to_string(),
+        Err(_) => String::new(),
+    };
+    let target = format!("{arch}-apple-macos11");
     // `swiftc` comes with Xcode or the Command Line Tools (xcode-select --install);
     // `xcrun` finds it even when it isn't on PATH.
     let compile = |program: &str, pre: &[&str]| {
         Command::new(program)
             .args(pre)
+            .args(["-target", &target])
             .args(["-O", "-suppress-warnings", "notifier/main.swift", "-o"])
             .arg(&out)
             .status()

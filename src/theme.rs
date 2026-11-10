@@ -112,10 +112,10 @@ pub fn available() -> Vec<String> {
     if let Some(entries) = dir().and_then(|d| std::fs::read_dir(d).ok()) {
         for e in entries.flatten() {
             let path = e.path();
-            if path.extension().is_some_and(|x| x == "toml") {
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    names.push(stem.to_string());
-                }
+            if path.extension().is_some_and(|x| x == "toml")
+                && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+            {
+                names.push(stem.to_string());
             }
         }
     }
@@ -147,10 +147,11 @@ fn load(name: &str) -> Result<Theme, String> {
 }
 
 fn short(p: Option<PathBuf>) -> String {
-    let p = p.map(|p| p.display().to_string()).unwrap_or_default();
-    match std::env::var("HOME") {
-        Ok(home) if p.starts_with(&home) => p.replacen(&home, "~", 1),
-        _ => p,
+    let Some(p) = p else { return String::new() };
+    // Path::strip_prefix matches whole components, so HOME=/Users/ro leaves /Users/rohan alone
+    match std::env::var_os("HOME").filter(|h| !h.is_empty()).and_then(|h| p.strip_prefix(h).ok().map(|r| r.to_owned())) {
+        Some(rest) => format!("~/{}", rest.display()),
+        None => p.display().to_string(),
     }
 }
 
@@ -190,8 +191,10 @@ struct LogFile {
 fn hex(key: &str, s: &str) -> Result<Rgb, String> {
     let h = s.trim().trim_start_matches('#');
     let byte = |i: usize| u8::from_str_radix(h.get(i..i + 2).unwrap_or("x"), 16);
-    match (h.len(), byte(0), byte(2), byte(4)) {
-        (6, Ok(r), Ok(g), Ok(b)) => Ok((r, g, b)),
+    // from_str_radix also takes a leading '+', so check the digits first
+    let digits = h.len() == 6 && h.bytes().all(|b| b.is_ascii_hexdigit());
+    match (digits, byte(0), byte(2), byte(4)) {
+        (true, Ok(r), Ok(g), Ok(b)) => Ok((r, g, b)),
         _ => Err(format!("{key} = \"{s}\" isn't a color like \"#ff8800\"")),
     }
 }
@@ -269,6 +272,7 @@ mod tests {
         assert_eq!(t.accent, Color::Rgb(255, 0, 0));
         assert_eq!(t.text, DEFAULT.text);
         assert!(parse("accent = \"red\"").unwrap_err().contains("accent"));
+        assert!(parse("accent = \"#+f+f+f\"").is_err());
         assert!(parse("acent = \"#ff0000\"").is_err());
         assert!(parse("util = [\"#ff0000\"]").unwrap_err().contains("2 colors"));
     }

@@ -11,7 +11,6 @@ use regex::Regex;
 
 use crate::util::*;
 
-
 static TOKENS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(concat!(
         r"(?P<ts>\[?\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?\]?|\b\d{2}:\d{2}:\d{2}(?:[.,]\d+)?\b)",
@@ -45,14 +44,15 @@ pub fn line(text: &str) -> Line<'static> {
 }
 
 fn plain(text: &str) -> Line<'static> {
+    let th = t();
     let base = if ERROR_LINE.is_match(text) {
-        Style::new().fg(t().log_error)
+        Style::new().fg(th.log_error)
     } else if WARN_LINE.is_match(text) {
-        Style::new().fg(t().log_warning)
+        Style::new().fg(th.log_warning)
     } else if TRACE_FRAME.is_match(text) {
-        Style::new().fg(t().dim)
+        Style::new().fg(th.dim)
     } else {
-        Style::new().fg(t().text)
+        Style::new().fg(th.text)
     };
 
     let mut spans = Vec::new();
@@ -63,29 +63,29 @@ fn plain(text: &str) -> Line<'static> {
             spans.push(Span::styled(text[last..m.start()].to_string(), base));
         }
         let style = if caps.name("ts").is_some() {
-            Style::new().fg(t().dim)
+            Style::new().fg(th.dim)
         } else if caps.name("err").is_some() {
-            Style::new().fg(t().failed).bold()
+            Style::new().fg(th.failed).bold()
         } else if caps.name("warn").is_some() {
-            Style::new().fg(t().queued).bold()
+            Style::new().fg(th.queued).bold()
         } else if caps.name("info").is_some() {
-            Style::new().fg(t().accent)
+            Style::new().fg(th.accent)
         } else if caps.name("debug").is_some() {
-            Style::new().fg(t().dim)
+            Style::new().fg(th.dim)
         } else if caps.name("ok").is_some() {
-            Style::new().fg(t().running)
+            Style::new().fg(th.running)
         } else if caps.name("url").is_some() {
-            Style::new().fg(t().accent).underlined()
+            Style::new().fg(th.accent).underlined()
         } else if caps.name("str").is_some() {
-            Style::new().fg(t().log_string)
+            Style::new().fg(th.log_string)
         } else if caps.name("path").is_some() {
-            Style::new().fg(t().log_path)
+            Style::new().fg(th.log_path)
         } else if caps.name("key").is_some() {
-            Style::new().fg(t().log_key)
+            Style::new().fg(th.log_key)
         } else if caps.name("num").is_some() {
-            Style::new().fg(t().log_number)
+            Style::new().fg(th.log_number)
         } else if caps.name("bar").is_some() {
-            Style::new().fg(t().log_bar)
+            Style::new().fg(th.log_bar)
         } else {
             base
         };
@@ -218,5 +218,8 @@ mod tests {
     fn non_color_escapes_are_dropped() {
         let cleaned = crate::util::clean_log_line("\x1b[2Kprogress 10%\rprogress 50%");
         assert_eq!(cleaned, "progress 50%");
+        // OSC titles / hyperlinks and charset switches (tput sgr0) leave nothing behind
+        let cleaned = crate::util::clean_log_line("a\x1b]0;title\x07b\x1b]8;;http://x\x1b\\c\x1b(B\x1b[md");
+        assert_eq!(cleaned, "abc\x1b[md");
     }
 }
