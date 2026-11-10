@@ -64,6 +64,8 @@ live, `enter` keeps it and `esc` goes back. Make your own by adding a
 
 - `s` opens a shell **inside a running job**, on its GPU node.
 - `x` cancels a job (asks first). `/` filters by name, folder or id.
+- Each Slurm cluster shows your **fairshare rank** among its users (`fairshare #812 of 9000
+  users`), since the raw score means little alone. It's checked every 10 minutes.
 - One shared ssh connection per cluster keeps refreshes quick. Each cluster refreshes on
   its own timer, so one that stops answering shows an error and retries without holding up the rest.
 

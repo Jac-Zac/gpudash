@@ -11,11 +11,13 @@ use std::sync::atomic::Ordering;
 use crate::config::{self, ClockFormat, ClusterConf, Config, Ended, TempUnit};
 use crate::notifier;
 use crate::palette::{Cmd, Palette, Prompt, PromptKind};
-use crate::remote::{self, Gpu, Job, Log, Snapshot};
+use crate::remote::{self, Fairshare, Gpu, Job, Log, Snapshot};
 use crate::util::{CLOCK_24H, FAHRENHEIT};
 
 const HISTORY_LEN: usize = 120;
 const LOG_REFRESH: Duration = Duration::from_secs(3);
+/// sshare -a takes seconds on a big cluster and fairshare moves slowly, so ask rarely.
+const FAIRSHARE_REFRESH: Duration = Duration::from_secs(600);
 
 pub struct Cluster {
     pub source: ClusterConf,
@@ -28,6 +30,9 @@ pub struct Cluster {
     pub loading_since: Instant,
     /// job id -> (stdout, stderr) path patterns; kept on disk so logs of old jobs stay reachable
     pub outputs: HashMap<String, (String, String)>,
+    pub fairshare: Option<Fairshare>,
+    /// when fairshare was last asked for; cleared on failure so the next poll retries
+    fairshare_asked: Option<Instant>,
 }
 
 impl Cluster {
@@ -76,6 +81,7 @@ pub enum Msg {
     Log(String, bool, Result<Option<Log>, String>),
     Cancelled(String, Result<(), String>),
     PodAction(String, crate::runpod::Action, Result<(), String>),
+    Fairshare(usize, Result<Option<Fairshare>, String>), // (cluster uid, result)
 }
 
 pub struct App {
@@ -165,6 +171,8 @@ impl App {
             error: None,
             loading: false,
             loading_since: Instant::now(),
+            fairshare: None,
+            fairshare_asked: None,
         });
         self.next_uid += 1;
     }
@@ -268,9 +276,14 @@ impl App {
             }
             c.loading = true;
             c.loading_since = Instant::now();
+            let fairshare = !c.source.is_runpod() && c.fairshare_asked.is_none_or(|t| t.elapsed() >= FAIRSHARE_REFRESH);
+            if fairshare {
+                c.fairshare_asked = Some(Instant::now());
+            }
             let (tx, source, uid) = (self.tx.clone(), c.source.clone(), c.uid);
             // Job states first, then GPU readings. A successful Slurm Jobs message is always followed
             // by a Gpus message, and the cluster stays loading until it arrives; Runpod sends only Jobs.
+            // Fairshare comes last, so the slow sshare never holds up jobs or GPUs.
             thread::spawn(move || {
                 let jobs = remote::fetch(&source);
                 let running: Option<Vec<String>> = jobs.as_ref().ok()
@@ -278,6 +291,9 @@ impl App {
                 let _ = tx.send(Msg::Jobs(uid, jobs));
                 if !source.is_runpod() && let Some(ids) = running {
                     let _ = tx.send(Msg::Gpus(uid, remote::fetch_gpus(&source.host, &ids)));
+                    if fairshare {
+                        let _ = tx.send(Msg::Fairshare(uid, remote::fetch_fairshare(&source.host)));
+                    }
                 }
             });
         }
@@ -303,6 +319,14 @@ impl App {
                 Msg::Gpus(uid, result) => {
                     if let Some(i) = self.clusters.iter().position(|c| c.uid == uid) {
                         self.got_gpus(i, result);
+                    }
+                }
+                Msg::Fairshare(uid, result) => {
+                    if let Some(c) = self.clusters.iter_mut().find(|c| c.uid == uid) {
+                        match result {
+                            Ok(fs) => c.fairshare = fs,
+                            Err(_) => c.fairshare_asked = None,
+                        }
                     }
                 }
                 Msg::Log(id, stderr, result) => {
@@ -348,6 +372,7 @@ impl App {
             Err(e) => {
                 c.loading = false;
                 c.error = Some(e);
+                c.fairshare_asked = None; // the fairshare poll was skipped; ask again next time
                 return;
             }
         };
@@ -1012,6 +1037,7 @@ mod tests {
         Cluster {
             source: ClusterConf { host: "test".into(), ..ClusterConf::default() }, uid, jobs: None, fetched: None,
             error: None, loading: false, loading_since: Instant::now(), outputs: HashMap::new(),
+            fairshare: None, fairshare_asked: None,
         }
     }
 

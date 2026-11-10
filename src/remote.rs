@@ -106,6 +106,37 @@ cat "$t"/* 2>/dev/null
 rm -rf "$t"
 "#;
 
+// Fairshare values only mean something next to other users', so rank ours among everyone's.
+// A user in several accounts counts once, with their best value. Ranking happens on the
+// login node because sshare -a lists every association (tens of thousands of lines).
+const FAIRSHARE_SCRIPT: &str = r#"
+echo "@@FAIRSHARE"
+sshare -a -n -P -o User,FairShare 2>/dev/null | awk -F'|' -v me="$USER" '
+  $1 != "" && $2 != "" { if (!($1 in best) || $2 + 0 > best[$1]) best[$1] = $2 + 0 }
+  END {
+    if (!(me in best)) exit
+    for (u in best) { n++; if (best[u] > best[me]) above++ }
+    printf "@@FS|%d|%d\n", above + 1, n
+  }'
+"#;
+
+/// Our place among the cluster's users by fairshare; 1 is the highest priority.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Fairshare {
+    pub rank: usize,
+    pub users: usize,
+}
+
+/// None when the cluster has no fairshare for us (no sshare, or we aren't in its list).
+pub fn fetch_fairshare(host: &str) -> Result<Option<Fairshare>, String> {
+    Ok(parse_fairshare(&run(host, FAIRSHARE_SCRIPT)?))
+}
+
+fn parse_fairshare(out: &str) -> Option<Fairshare> {
+    let (rank, users) = out.lines().find_map(|l| l.strip_prefix("@@FS|"))?.split_once('|')?;
+    Some(Fairshare { rank: rank.trim().parse().ok()?, users: users.trim().parse().ok()? })
+}
+
 /// Time limit, so a hung connection shows an error instead of loading forever.
 const RUN_LIMIT: Duration = Duration::from_secs(60);
 
@@ -471,6 +502,21 @@ srun() {{ echo UNEXPECTED; }}
 {JOBS_SCRIPT}"#));
         assert!(!out.contains("UNEXPECTED"));
         assert!(out.contains("@@JOB|42|"));
+    }
+
+    #[test]
+    fn fairshare_ranks_each_user_once_by_their_best_account() {
+        let rank = |rows: &str| parse_fairshare(&bash(&format!(r#"
+USER=me
+sshare() {{ printf '%s\n' {rows}; }}
+{FAIRSHARE_SCRIPT}"#, rows = sh_quote(rows))));
+        // Account rows have no user. me's best is 0.5 (second account); dave ties and isn't
+        // above; carol counts once with her best. Above me: root, alice, carol.
+        let rows = "|\nroot|0.600000\nme|0.200000\nalice|0.900000\nbob|0.200000\nbob|0.100000\n\
+                    carol|0.100000\ncarol|0.950000\n|\nme|0.500000\ndave|0.500000\nerin|0.300000";
+        assert_eq!(rank(rows), Some(Fairshare { rank: 4, users: 7 }));
+        assert_eq!(rank("|\nalice|0.9"), None, "not in the list");
+        assert_eq!(rank(""), None, "sshare missing or empty");
     }
 
     #[test]

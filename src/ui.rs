@@ -210,6 +210,9 @@ fn draw_cluster(f: &mut Frame, area: Rect, app: &App, ci: usize, c: &Cluster, jo
         }
         title.push(dim(counts + " "));
     }
+    if let Some(fs) = c.fairshare {
+        title.extend([dim("· fairshare "), text(format!("#{}", fs.rank)), dim(format!(" of {} users ", fs.users))]);
+    }
     if c.loading {
         title.extend([spinner(app.tick), Span::raw(" ")]);
         let waited = c.loading_since.elapsed().as_secs();
